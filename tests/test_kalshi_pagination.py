@@ -6,6 +6,9 @@ import logging
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
+from kalshi_weather_bot.exceptions import KalshiAPIError, KalshiRequestError
 from kalshi_weather_bot.kalshi_client import KalshiClient
 
 
@@ -23,6 +26,9 @@ def _settings(**overrides: Any) -> SimpleNamespace:
         "kalshi_max_pages_per_fetch": 10,
         "kalshi_max_markets_fetch": 2000,
         "kalshi_page_sleep_ms": 0,
+        "kalshi_page_fetch_max_retries": 2,
+        "kalshi_page_retry_base_ms": 0,
+        "kalshi_page_retry_jitter_ms": 0,
     }
     payload.update(overrides)
     return SimpleNamespace(**payload)
@@ -414,6 +420,101 @@ def test_pagination_summary_in_payload(monkeypatch: Any) -> None:
     assert "max_markets_fetch" in pagination
 
 
+def test_page_retry_on_timeout_then_success(monkeypatch: Any) -> None:
+    client = _client()
+    calls = 0
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del method, endpoint, json_body
+        calls += 1
+        if params and params.get("cursor") == "c2" and calls == 2:
+            raise KalshiRequestError("timeout", category="network", status_code=None)
+        if params and params.get("cursor") == "c2":
+            return {"markets": [{"ticker": "B"}]}
+        return {"markets": [{"ticker": "A"}], "cursor": "c2"}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        payload = client.fetch_markets_raw(limit=100)
+    finally:
+        client.close()
+
+    assert isinstance(payload, dict)
+    assert [item["ticker"] for item in payload["markets"]] == ["A", "B"]
+    assert payload["pagination"]["pages_fetched"] == 2
+    assert calls == 3
+
+
+def test_page_retry_repeated_timeout_then_success(monkeypatch: Any) -> None:
+    client = _client(kalshi_page_fetch_max_retries=3)
+    calls = 0
+    cursor_failures = 0
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal calls, cursor_failures
+        del method, endpoint, json_body
+        calls += 1
+        if params and params.get("cursor") == "c2":
+            if cursor_failures < 2:
+                cursor_failures += 1
+                raise KalshiRequestError("read timed out", category="network", status_code=None)
+            return {"markets": [{"ticker": "B"}]}
+        return {"markets": [{"ticker": "A"}], "cursor": "c2"}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        payload = client.fetch_markets_raw(limit=100)
+    finally:
+        client.close()
+
+    assert isinstance(payload, dict)
+    assert [item["ticker"] for item in payload["markets"]] == ["A", "B"]
+    assert calls == 4
+
+
+def test_page_retry_hard_failure_includes_progress_context(monkeypatch: Any) -> None:
+    client = _client(kalshi_page_fetch_max_retries=1)
+    calls = 0
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del method, endpoint, json_body
+        calls += 1
+        if params and params.get("cursor") == "c2":
+            raise KalshiRequestError("timeout", category="network", status_code=None)
+        return {"markets": [{"ticker": "A"}], "cursor": "c2"}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        with pytest.raises(KalshiAPIError) as exc_info:
+            client.fetch_markets_raw(limit=100)
+        message = str(exc_info.value)
+    finally:
+        client.close()
+
+    assert "page_index=2" in message
+    assert "cursor_present=True" in message
+    assert "pages_fetched_so_far=1" in message
+    assert "total_markets_fetched_so_far=1" in message
+    assert calls == 3
+
+
 def test_day5_diagnostics_extraction_from_pagination_payload() -> None:
     """_extract_market_fetch_diagnostics reads pagination dict correctly."""
     from kalshi_weather_bot.day5_cli import _extract_market_fetch_diagnostics
@@ -456,3 +557,63 @@ def test_day5_diagnostics_fallback_no_cursor() -> None:
     diag = _extract_market_fetch_diagnostics(payload, record_count=1)
     assert diag["had_more_pages"] is False
 
+
+def test_page_retry_auth_error_does_not_retry(monkeypatch: Any) -> None:
+    """Auth errors (non-retryable) should not be retried at the page level."""
+    client = _client(kalshi_page_fetch_max_retries=3)
+    calls = 0
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del method, endpoint, json_body
+        calls += 1
+        if params and params.get("cursor") == "c2":
+            raise KalshiRequestError(
+                "Authentication failed", category="auth", status_code=401
+            )
+        return {"markets": [{"ticker": "A"}], "cursor": "c2"}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        with pytest.raises(KalshiAPIError):
+            client.fetch_markets_raw(limit=100)
+    finally:
+        client.close()
+
+    # First page OK (call 1), second page auth fail (call 2), NO retries.
+    assert calls == 2
+
+
+def test_page_retry_validation_error_does_not_retry(monkeypatch: Any) -> None:
+    """Validation errors (non-retryable) should not be retried at the page level."""
+    client = _client(kalshi_page_fetch_max_retries=3)
+    calls = 0
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del method, endpoint, json_body
+        calls += 1
+        if params and params.get("cursor") == "c2":
+            raise KalshiRequestError(
+                "Bad request", category="validation", status_code=400
+            )
+        return {"markets": [{"ticker": "A"}], "cursor": "c2"}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        with pytest.raises(KalshiAPIError):
+            client.fetch_markets_raw(limit=100)
+    finally:
+        client.close()
+
+    assert calls == 2

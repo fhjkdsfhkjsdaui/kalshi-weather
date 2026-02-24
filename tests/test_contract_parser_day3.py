@@ -96,7 +96,13 @@ def test_ambiguous_weather_title_rejects_safely() -> None:
 
 def test_non_weather_title_marked_unsupported() -> None:
     parser = KalshiWeatherContractParser()
-    parsed = parser.parse_market(_market("Will the Fed funds rate be above 5.5%?"))
+    parsed = parser.parse_market(
+        _market(
+            "Will the Fed funds rate be above 5.5%?",
+            event_ticker="KXPOLITICS-TEST",
+            ticker="KXPOLITICS-TEST",
+        )
+    )
     assert parsed.weather_candidate is False
     assert parsed.parse_status == "unsupported"
     assert parsed.rejection_reasons == ["non_weather_market"]
@@ -111,6 +117,68 @@ def test_operator_and_unit_parsing_for_wind() -> None:
     assert parsed.threshold_operator == "<="
     assert parsed.threshold_value == 35
     assert parsed.threshold_unit == "mph"
+
+
+def test_kalshi_event_ticker_prefix_marks_weather_candidate() -> None:
+    parser = KalshiWeatherContractParser()
+    market = {
+        "event_ticker": "KXHIGHTEMP-NYC",
+        "ticker": "KXHIGHTEMP-NYC-20260224-T90",
+        "title": "High temperature in New York, NY",
+        "yes_sub_title": "90F or above",
+        "status": "active",
+    }
+    is_candidate = parser._is_weather_candidate(market["title"], market)
+    assert is_candidate is True
+
+
+def test_extract_dimension_fallback_uses_event_ticker_prefix() -> None:
+    parser = KalshiWeatherContractParser()
+    market = {
+        "event_ticker": "KXLOWTEMP-CHICAGO",
+        "ticker": "KXLOWTEMP-CHI-20260224-T10",
+        "title": "Contract settles tomorrow",
+    }
+    dimension, subtype = parser._extract_dimension("contract settles tomorrow", market)
+    assert dimension == "temperature"
+    assert subtype == "low_temp"
+
+
+def test_parse_kalshi_shaped_weather_market_end_to_end() -> None:
+    parser = KalshiWeatherContractParser()
+    parsed = parser.parse_market(
+        {
+            "event_ticker": "KXHIGHTEMP-CHICAGO",
+            "ticker": "KXHIGHTEMP-CHI-20260224-T90",
+            "title": "High temperature in Chicago, IL",
+            "subtitle": "above 90F",
+            "yes_sub_title": "Yes",
+            "status": "active",
+        }
+    )
+    assert parsed.weather_candidate is True
+    assert parsed.parse_status == "parsed"
+    assert parsed.weather_dimension == "temperature"
+    assert parsed.metric_subtype == "high_temp"
+    assert parsed.threshold_operator == ">"
+    assert parsed.threshold_value == 90
+    assert parsed.threshold_unit == "F"
+
+
+def test_parse_kalshi_shaped_non_weather_market_stays_non_weather() -> None:
+    parser = KalshiWeatherContractParser()
+    parsed = parser.parse_market(
+        {
+            "event_ticker": "KXPOLITICS-2026",
+            "ticker": "KXPOLITICS-PRES-20261103",
+            "title": "Will candidate X win the presidential election?",
+            "yes_sub_title": "Yes",
+            "status": "active",
+        }
+    )
+    assert parsed.weather_candidate is False
+    assert parsed.parse_status == "unsupported"
+    assert parsed.rejection_reasons == ["non_weather_market"]
 
 
 def test_datetime_extraction_from_market_fields() -> None:
@@ -144,7 +212,11 @@ def test_contract_parser_cli_smoke(tmp_path: Path, monkeypatch: Any, capsys: Any
     payload = {
         "markets": [
             _market("Will high temperature in Dallas, TX be above 95F?"),
-            _market("Will the Fed funds rate be above 5.5%?", ticker="KXNONWEATHER"),
+            _market(
+                "Will the Fed funds rate be above 5.5%?",
+                ticker="KXNONWEATHER",
+                event_ticker="KXPOLITICS-RATES",
+            ),
         ]
     }
     input_file = tmp_path / "markets.json"
@@ -337,7 +409,11 @@ class TestSummarizeParsResults:
         results = parser.parse_markets([
             _market("Will high temp in NYC, NY be above 90F?"),
             _market("Will the weather in LA, CA be nice?"),
-            _market("Will the stock market crash?"),
+            _market(
+                "Will the stock market crash?",
+                event_ticker="KXPOLITICS-TEST",
+                ticker="KXPOLITICS-TEST",
+            ),
         ])
         summary = summarize_parse_results(results)
         assert summary.total_markets_scanned == 3

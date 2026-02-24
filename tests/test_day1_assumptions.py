@@ -505,7 +505,28 @@ class TestKeySecretFileLoading:
 
 
 # ===========================================================================
-# 8. RSA-PSS signing
+# 8. Config — signal defaults
+# ===========================================================================
+
+
+def test_signal_max_markets_to_scan_default_is_1000(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.setenv("KALSHI_API_BASE_URL", "https://api.example.com")
+    monkeypatch.setenv("KALSHI_AUTH_MODE", "bearer")
+    monkeypatch.setenv("KALSHI_BEARER_TOKEN", "test-token")
+    monkeypatch.setenv("NWS_USER_AGENT", "test-agent")
+    monkeypatch.setenv("DRY_RUN_MODE", "true")
+    monkeypatch.setenv("EXECUTION_MODE", "dry_run")
+    monkeypatch.delenv("SIGNAL_MAX_MARKETS_TO_SCAN", raising=False)
+
+    settings = Settings(_env_file=None)
+    assert settings.signal_max_markets_to_scan == 1000
+
+
+# ===========================================================================
+# 9. RSA-PSS signing
 # ===========================================================================
 
 

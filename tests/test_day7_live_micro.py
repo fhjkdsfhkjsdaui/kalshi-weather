@@ -14,6 +14,8 @@ import pytest
 
 from kalshi_weather_bot import day7_cli
 from kalshi_weather_bot.config import load_settings
+from kalshi_weather_bot.contracts.models import ParsedWeatherContract
+from kalshi_weather_bot.exceptions import KalshiAPIError
 from kalshi_weather_bot.execution.live_adapter import OrderAdapterError
 from kalshi_weather_bot.execution.live_micro import LiveMicroRunner
 from kalshi_weather_bot.execution.live_models import KalshiOrderStatus
@@ -1377,3 +1379,258 @@ def test_no_secret_leakage_in_micro_session_journal(tmp_path: Path) -> None:
         "bearer ",
     ):
         assert secret_pattern.lower() not in content.lower()
+
+
+def test_weather_filter_rejection_reason_counting() -> None:
+    parsed_non_weather = ParsedWeatherContract(
+        provider_market_id="m1",
+        raw_title="Will candidate X win?",
+        weather_candidate=False,
+        parse_confidence=0.1,
+        parse_status="rejected",
+    )
+    parsed_closed_non_weather = ParsedWeatherContract(
+        provider_market_id="m2",
+        raw_title="Political market",
+        weather_candidate=False,
+        parse_confidence=0.1,
+        parse_status="rejected",
+    )
+    parsed_weather_parse_fail = ParsedWeatherContract(
+        provider_market_id="m3",
+        raw_title="NYC temperature above 90F?",
+        weather_candidate=True,
+        parse_confidence=0.55,
+        parse_status="ambiguous",
+    )
+
+    reasons_1 = day7_cli._weather_filter_rejection_reasons(
+        raw_market={"title": "Will candidate X win?"},
+        parsed=parsed_non_weather,
+    )
+    reasons_2 = day7_cli._weather_filter_rejection_reasons(
+        raw_market={
+            "title": "Political market",
+            "ticker": "POL-1",
+            "category": "Politics",
+            "status": "closed",
+        },
+        parsed=parsed_closed_non_weather,
+    )
+    reasons_3 = day7_cli._weather_filter_rejection_reasons(
+        raw_market={
+            "title": "NYC temperature above 90F?",
+            "ticker": "WX-NYC",
+            "category": "Weather",
+            "status": "open",
+        },
+        parsed=parsed_weather_parse_fail,
+    )
+
+    assert "missing_category_field" in reasons_1
+    assert "missing_title_ticker" in reasons_1
+    assert "category_mismatch" in reasons_2
+    assert "closed_inactive" in reasons_2
+    assert "parse_failure" in reasons_3
+
+
+def test_day7_cycle_continues_after_market_fetch_timeout(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    _set_required_env(monkeypatch, tmp_path)
+    calls = {"n": 0}
+
+    def _flaky_eval(
+        *, args: Any, settings: Any, logger: Any, journal: Any
+    ) -> tuple[Any, Any, Any]:
+        del args, settings, logger, journal
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KalshiAPIError("Kalshi API request failed: The read operation timed out")
+        return [], [], {
+            "scanned": 0,
+            "weather_candidates": 0,
+            "matched": 0,
+            "estimated": 0,
+            "filtered": 0,
+            "selected": 0,
+            "pages_fetched": 1,
+            "total_markets_fetched": 0,
+            "weather_markets_after_filter": 0,
+            "candidates_generated": 0,
+            "had_more_pages": 0,
+            "deduped_count": 0,
+        }
+
+    monkeypatch.setattr(day7_cli, "_evaluate_signal_candidates", _flaky_eval)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kalshi-weather-day7",
+            "--dry-run",
+            "--ui-mode",
+            "plain",
+            "--max-cycles",
+            "2",
+        ],
+    )
+
+    exit_code = day7_cli.main()
+    assert exit_code == 0
+    assert calls["n"] == 2
+
+    journal_files = sorted((tmp_path / "journal").glob("*.jsonl"))
+    assert journal_files
+    events = [
+        json.loads(line)
+        for line in journal_files[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    event_types = [event["event_type"] for event in events]
+    assert "micro_cycle_data_failure" in event_types
+    summary_event = next(item for item in events if item["event_type"] == "micro_session_summary")
+    assert summary_event["payload"]["cycle_data_failures"] == 1
+
+
+# --- _resolve_runtime_mode tests ---
+
+
+class TestResolveRuntimeMode:
+    """Verify mode precedence, dry-run override, and conflict detection."""
+
+    def _args(self, **overrides: Any) -> SimpleNamespace:
+        defaults: dict[str, Any] = {
+            "mode": None,
+            "dry_run": None,
+        }
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _settings_ns(self, **overrides: Any) -> Any:
+        """Build a settings-like object for _resolve_runtime_mode."""
+        defaults: dict[str, Any] = {
+            "execution_mode": "dry_run",
+            "allow_live_api": True,
+            "allow_live_fills": True,
+            "micro_mode_enabled": True,
+        }
+        defaults.update(overrides)
+        ns = _settings(**defaults)
+
+        def _model_copy(update: dict[str, Any] | None = None) -> Any:
+            merged = {k: v for k, v in ns.__dict__.items() if k != "model_copy"}
+            if update:
+                merged.update(update)
+            copy = SimpleNamespace(**merged)
+            copy.model_copy = _model_copy  # type: ignore[attr-defined]
+            return copy
+
+        ns.model_copy = _model_copy  # type: ignore[attr-defined]
+        return ns
+
+    def test_default_dry_run_from_config(self) -> None:
+        settings, mode, dry_run = day7_cli._resolve_runtime_mode(
+            settings=self._settings_ns(execution_mode="dry_run"),
+            args=self._args(),
+            logger=logging.getLogger("test"),
+        )
+        assert mode == "dry_run"
+        assert dry_run is True
+
+    def test_cli_mode_overrides_config(self) -> None:
+        settings, mode, dry_run = day7_cli._resolve_runtime_mode(
+            settings=self._settings_ns(execution_mode="dry_run"),
+            args=self._args(mode="live_micro", dry_run=False),
+            logger=logging.getLogger("test"),
+        )
+        assert mode == "live_micro"
+        assert dry_run is False
+
+    def test_dry_run_flag_forces_dry_run(self) -> None:
+        settings, mode, dry_run = day7_cli._resolve_runtime_mode(
+            settings=self._settings_ns(execution_mode="dry_run"),
+            args=self._args(dry_run=True),
+            logger=logging.getLogger("test"),
+        )
+        assert mode == "dry_run"
+        assert dry_run is True
+
+    def test_live_micro_with_dry_run_true_raises(self) -> None:
+        with pytest.raises(ValueError, match="Conflicting runtime flags"):
+            day7_cli._resolve_runtime_mode(
+                settings=self._settings_ns(execution_mode="dry_run"),
+                args=self._args(mode="live_micro", dry_run=True),
+                logger=logging.getLogger("test"),
+            )
+
+    def test_cancel_only_mode_rejected(self) -> None:
+        with pytest.raises(ValueError, match="cancel-only"):
+            day7_cli._resolve_runtime_mode(
+                settings=self._settings_ns(execution_mode="live_cancel_only"),
+                args=self._args(),
+                logger=logging.getLogger("test"),
+            )
+
+    def test_no_dry_run_without_live_micro_raises(self) -> None:
+        with pytest.raises(ValueError, match="dry_run=false requires"):
+            day7_cli._resolve_runtime_mode(
+                settings=self._settings_ns(execution_mode="dry_run"),
+                args=self._args(mode="dry_run", dry_run=False),
+                logger=logging.getLogger("test"),
+            )
+
+    def test_settings_updated_with_effective_mode(self) -> None:
+        settings, mode, dry_run = day7_cli._resolve_runtime_mode(
+            settings=self._settings_ns(execution_mode="live_micro"),
+            args=self._args(dry_run=True),
+            logger=logging.getLogger("test"),
+        )
+        assert settings.execution_mode == "dry_run"
+        assert mode == "dry_run"
+        assert dry_run is True
+
+
+# --- _weather_near_miss_sample bounds ---
+
+
+def test_weather_near_miss_sample_truncates_title() -> None:
+    parsed = ParsedWeatherContract(
+        provider_market_id="m1",
+        raw_title="X" * 200,
+        weather_candidate=False,
+        parse_confidence=0.1,
+        parse_status="rejected",
+    )
+    sample = day7_cli._weather_near_miss_sample(
+        raw_market={
+            "title": "X" * 200,
+            "ticker": "ABC",
+            "tags": [f"tag{i}" for i in range(10)],
+        },
+        parsed=parsed,
+        rejection_reasons=["missing_category_field"],
+    )
+    assert len(sample["title"]) <= 120
+    assert len(sample["tags"]) <= 5
+
+
+def test_weather_filter_returns_empty_for_valid_weather_contract() -> None:
+    parsed = ParsedWeatherContract(
+        provider_market_id="m1",
+        raw_title="NYC high temp above 90?",
+        weather_candidate=True,
+        parse_confidence=0.9,
+        parse_status="parsed",
+    )
+    reasons = day7_cli._weather_filter_rejection_reasons(
+        raw_market={
+            "title": "NYC high temp above 90?",
+            "ticker": "WX-NYC",
+            "category": "Weather",
+            "status": "open",
+        },
+        parsed=parsed,
+    )
+    assert reasons == []

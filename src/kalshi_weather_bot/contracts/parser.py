@@ -75,6 +75,14 @@ _LOCATION_PREFIX_RE = re.compile(
     r"(?=(?:high|low|temperature|temp|rain|rainfall|snow|snowfall|wind)\b)"
 )
 _STATE_CODE_RE = re.compile(r"^[A-Z]{2}$")
+_WEATHER_EVENT_TICKER_PREFIXES = (
+    "KXHIGHTEMP",
+    "KXLOWTEMP",
+    "KXSNOW",
+    "KXRAIN",
+    "KXWIND",
+    "KXWEATHER",
+)
 
 
 @dataclass
@@ -120,7 +128,7 @@ class KalshiWeatherContractParser:
         rejection_reasons: list[str] = []
 
         if weather_candidate:
-            weather_dimension, metric_subtype = self._extract_dimension(search_text)
+            weather_dimension, metric_subtype = self._extract_dimension(search_text, market)
             threshold = self._extract_threshold(search_text)
             location_raw = self._extract_location(title, subtitle)
             location_normalized = self._normalize_location(location_raw)
@@ -192,13 +200,22 @@ class KalshiWeatherContractParser:
         )
 
     def _is_weather_candidate(self, search_text: str, market: dict[str, Any]) -> bool:
+        event_ticker = self._first_string(market, ("event_ticker", "ticker"))
+        if event_ticker:
+            normalized_event_ticker = event_ticker.strip().upper()
+            if normalized_event_ticker.startswith(_WEATHER_EVENT_TICKER_PREFIXES):
+                return True
+
         tags = market.get("tags")
         if isinstance(tags, list):
             for tag in tags:
                 if isinstance(tag, str) and tag.strip().lower() == "weather":
                     return True
 
-        category = self._first_string(market, ("category", "series", "event_category"))
+        category = self._first_string(
+            market,
+            ("category", "series", "event_category", "event_ticker"),
+        )
         if category and "weather" in category.lower():
             return True
 
@@ -218,7 +235,11 @@ class KalshiWeatherContractParser:
         )
         return any(re.search(pattern, lowered) for pattern in weather_patterns)
 
-    def _extract_dimension(self, search_text: str) -> tuple[WeatherDimension | None, str | None]:
+    def _extract_dimension(
+        self,
+        search_text: str,
+        market: dict[str, Any],
+    ) -> tuple[WeatherDimension | None, str | None]:
         lowered = search_text.lower()
         if re.search(r"\bhigh\s+temp(?:erature)?\b", lowered):
             return "temperature", "high_temp"
@@ -238,6 +259,21 @@ class KalshiWeatherContractParser:
         # It will still be flagged as weather_candidate but dimension=None
         # forces the contract through the rejection path, preventing
         # overconfident parsing of ambiguous titles.
+        event_ticker = self._first_string(market, ("event_ticker", "ticker"))
+        if event_ticker:
+            normalized_event_ticker = event_ticker.strip().upper()
+            if "HIGHTEMP" in normalized_event_ticker:
+                return "temperature", "high_temp"
+            if "LOWTEMP" in normalized_event_ticker:
+                return "temperature", "low_temp"
+            if "SNOW" in normalized_event_ticker:
+                return "snowfall", "snowfall_accumulation"
+            if "RAIN" in normalized_event_ticker or "PRECIP" in normalized_event_ticker:
+                return "precipitation", "total_precipitation"
+            if "WIND" in normalized_event_ticker and "GUST" in normalized_event_ticker:
+                return "wind", "wind_gust"
+            if "WIND" in normalized_event_ticker:
+                return "wind", "wind_speed"
         return None, None
 
     def _extract_threshold(self, search_text: str) -> _ThresholdExtraction:

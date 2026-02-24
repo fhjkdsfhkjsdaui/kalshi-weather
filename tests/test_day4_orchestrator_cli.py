@@ -24,7 +24,7 @@ def _set_required_env(monkeypatch: Any, tmp_path: Path) -> None:
 
 
 def test_day4_cli_fixture_smoke(monkeypatch: Any, tmp_path: Path, capsys: Any) -> None:
-    now = datetime(2026, 2, 24, 12, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
     fixture = {
         "intents": [
             {
@@ -128,7 +128,7 @@ def test_day4_cli_fixture_kill_switch(
     monkeypatch: Any, tmp_path: Path, capsys: Any,
 ) -> None:
     """Fixture with kill_switch_active should reject all intents."""
-    now = datetime(2026, 2, 24, 12, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
     fixture = {
         "kill_switch_active": True,
         "intents": [
@@ -196,7 +196,7 @@ def test_day4_cli_nationwide_markets(
     monkeypatch: Any, tmp_path: Path, capsys: Any,
 ) -> None:
     """Fixture with markets from various US locations all process correctly."""
-    now = datetime(2026, 2, 24, 12, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
     fixture = {
         "intents": [
             {
@@ -238,7 +238,7 @@ def test_day4_cli_fixture_bare_list(
     monkeypatch: Any, tmp_path: Path, capsys: Any,
 ) -> None:
     """Fixture as bare list (no wrapper object) should work."""
-    now = datetime(2026, 2, 24, 12, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
     fixture = [
         {
             "market_id": "KX-BARE-LIST",
@@ -265,4 +265,3 @@ def test_day4_cli_fixture_bare_list(
     assert exit_code == 0
     output = capsys.readouterr().out
     assert "accepted=1" in output
-
