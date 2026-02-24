@@ -1,0 +1,59 @@
+{
+  "provider": "nws",
+  "provider_version": "day2-v1",
+  "retrieval_timestamp": "2026-02-24T06:00:00Z",
+  "forecast_type": "hourly",
+  "source_url": "https://api.weather.gov/gridpoints/SEW/124,67/forecast/hourly",
+  "points_url": "https://api.weather.gov/points/47.6062,-122.3321",
+  "generated_timestamp": "2026-02-24T05:40:00Z",
+  "updated_timestamp": "2026-02-24T05:50:00Z",
+  "location": {
+    "latitude": 47.6062,
+    "longitude": -122.3321,
+    "grid_id": "SEW",
+    "grid_x": 124,
+    "grid_y": 67,
+    "city": "Seattle",
+    "state": "WA"
+  },
+  "periods": [
+    {
+      "name": "Early Morning",
+      "start_time": "2026-02-24T06:00:00Z",
+      "end_time": "2026-02-24T09:00:00Z",
+      "temperature": 72,
+      "temperature_unit": "F",
+      "wind_speed": "12 mph",
+      "wind_direction": "NW",
+      "short_forecast": "Partly Cloudy",
+      "detailed_forecast": "Partly cloudy skies.",
+      "probability_of_precipitation": 20
+    },
+    {
+      "name": "Morning",
+      "start_time": "2026-02-24T09:00:00Z",
+      "end_time": "2026-02-24T12:00:00Z",
+      "temperature": 68,
+      "temperature_unit": "F",
+      "wind_speed": "15 mph",
+      "wind_direction": "W",
+      "short_forecast": "Chance Showers",
+      "detailed_forecast": "A slight chance of rain showers.",
+      "probability_of_precipitation": 35
+    },
+    {
+      "name": "Afternoon",
+      "start_time": "2026-02-24T12:00:00Z",
+      "end_time": "2026-02-24T15:00:00Z",
+      "temperature": 74,
+      "temperature_unit": "F",
+      "wind_speed": "18 mph",
+      "wind_direction": "SW",
+      "short_forecast": "Sunny",
+      "detailed_forecast": "Mostly sunny.",
+      "probability_of_precipitation": 10
+    }
+  ],
+  "raw_payload_path": "data/raw/weather/example_day5_weather.json"
+}
+

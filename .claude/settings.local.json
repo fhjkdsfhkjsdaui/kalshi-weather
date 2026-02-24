@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(ruff check:*)",
+      "Bash(.venv/bin/python:*)",
+      "WebFetch(domain:docs.kalshi.com)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(.venv/bin/ruff check:*)",
+      "Bash(find:*)",
+      "Bash(APP_ENV=dev KALSHI_API_BASE_URL=https://api.example.com KALSHI_AUTH_MODE=bearer KALSHI_BEARER_TOKEN=test-token NWS_USER_AGENT=test-agent JOURNAL_DIR=/tmp/kalshi_journal RAW_PAYLOAD_DIR=/tmp/kalshi_raw WEATHER_RAW_PAYLOAD_DIR=/tmp/kalshi_weather_raw .venv/bin/python:*)",
+      "Bash(APP_ENV=dev KALSHI_API_BASE_URL=https://api.example.com KALSHI_AUTH_MODE=bearer KALSHI_BEARER_TOKEN=test-token NWS_USER_AGENT=test-agent JOURNAL_DIR=/tmp/kalshi_d4_journal RAW_PAYLOAD_DIR=/tmp/kalshi_d4_raw WEATHER_RAW_PAYLOAD_DIR=/tmp/kalshi_d4_weather_raw DRY_RUN_MODE=true .venv/bin/python:*)",
+      "Bash(python -m ruff:*)"
+    ]
+  }
+}

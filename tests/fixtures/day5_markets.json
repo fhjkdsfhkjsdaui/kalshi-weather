@@ -1,0 +1,55 @@
+{
+  "markets": [
+    {
+      "ticker": "KXWEATHER-SEATTLE-TEMP",
+      "event_ticker": "KXWEATHER-SEATTLE",
+      "title": "Will high temperature in Seattle, WA be above 70F?",
+      "subtitle": "Seattle high temp",
+      "rules_primary": "Resolves YES if official high temperature exceeds 70F.",
+      "rules_secondary": "",
+      "status": "active",
+      "open_time": "2026-02-24T00:00:00Z",
+      "close_time": "2026-02-24T23:00:00Z",
+      "expiration_time": "2026-02-24T23:00:00Z",
+      "yes_sub_title": "Above 70F",
+      "no_sub_title": "70F or below",
+      "yes_ask": 40,
+      "yes_bid": 38,
+      "no_ask": 60,
+      "liquidity": 500
+    },
+    {
+      "ticker": "KXWEATHER-SEATTLE-VAGUE",
+      "event_ticker": "KXWEATHER-SEATTLE",
+      "title": "Will the weather in Seattle, WA be notable tomorrow?",
+      "subtitle": "",
+      "rules_primary": "",
+      "rules_secondary": "",
+      "status": "active",
+      "open_time": "2026-02-24T00:00:00Z",
+      "close_time": "2026-02-24T23:00:00Z",
+      "expiration_time": "2026-02-24T23:00:00Z",
+      "yes_ask": 50,
+      "yes_bid": 48,
+      "no_ask": 50,
+      "liquidity": 500
+    },
+    {
+      "ticker": "KXWEATHER-SEATTLE-WIND",
+      "event_ticker": "KXWEATHER-SEATTLE",
+      "title": "Will wind speed in Seattle, WA be above 40 mph?",
+      "subtitle": "",
+      "rules_primary": "",
+      "rules_secondary": "",
+      "status": "active",
+      "open_time": "2026-02-24T00:00:00Z",
+      "close_time": "2026-02-24T23:00:00Z",
+      "expiration_time": "2026-02-24T23:00:00Z",
+      "yes_ask": 20,
+      "yes_bid": 18,
+      "no_ask": 80,
+      "liquidity": 500
+    }
+  ]
+}
+
