@@ -6,6 +6,8 @@ import argparse
 import sys
 import uuid
 from collections import Counter
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import Settings, load_settings
+from .contracts.models import ParsedWeatherContract
 from .contracts.parser import KalshiWeatherContractParser
 from .day5_cli import (
     _market_liquidity,
@@ -47,6 +50,9 @@ from .signal.estimator import WeatherProbabilityEstimator
 from .signal.matcher import WeatherMarketMatcher
 from .signal.models import SignalEvaluation, SignalRejection
 from .signal.selector import CandidateSelector
+from .ui.terminal_dashboard import TerminalDashboard
+
+_MAX_WEATHER_DIAGNOSTIC_SAMPLES = 5
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,6 +83,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forecast-type", choices=["daily", "hourly"], default="hourly")
     parser.add_argument("--poll-timeout-seconds", type=float, default=None)
     parser.add_argument("--poll-interval-seconds", type=float, default=None)
+    parser.add_argument(
+        "--ui-mode",
+        choices=["plain", "rich"],
+        default="plain",
+        help="Terminal output mode; rich enables dashboard panels.",
+    )
     parser.add_argument(
         "--dry-run",
         action=argparse.BooleanOptionalAction,
@@ -156,6 +168,83 @@ def _resolve_runtime_mode(
     return runtime_settings, effective_mode, effective_dry_run
 
 
+def _first_market_string(raw_market: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = raw_market.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _weather_filter_rejection_reasons(
+    *,
+    raw_market: dict[str, Any],
+    parsed: ParsedWeatherContract,
+) -> list[str]:
+    """Classify why a market was excluded from weather-filtered candidates."""
+    reasons: list[str] = []
+
+    category = _first_market_string(raw_market, ("category", "series", "event_category", "group"))
+    tags = raw_market.get("tags")
+    weather_tag_present = isinstance(tags, list) and any(
+        isinstance(tag, str) and tag.strip().lower() == "weather"
+        for tag in tags
+    )
+    if not category and not weather_tag_present:
+        reasons.append("missing_category_field")
+    if category and "weather" not in category.lower() and not weather_tag_present:
+        reasons.append("category_mismatch")
+
+    title = _first_market_string(raw_market, ("title", "market_title", "name"))
+    ticker = _first_market_string(raw_market, ("ticker", "symbol"))
+    if not title or not ticker:
+        reasons.append("missing_title_ticker")
+
+    status = _first_market_string(raw_market, ("status", "market_status")) or ""
+    if status.lower() in {"closed", "inactive", "settled", "expired", "finalized"}:
+        reasons.append("closed_inactive")
+
+    event_type = _first_market_string(raw_market, ("event_type", "type", "market_type"))
+    if event_type and event_type.lower() not in {"binary", "event", "yes_no", "yes-no"}:
+        reasons.append("unsupported_event_type")
+
+    if parsed.weather_candidate and parsed.parse_status != "parsed":
+        reasons.append("parse_failure")
+
+    if not parsed.weather_candidate and not reasons:
+        reasons.append("unsupported_event_type")
+
+    # We only report reasons for excluded contracts.
+    if parsed.weather_candidate and parsed.parse_status == "parsed":
+        return []
+    return sorted(set(reasons))
+
+
+def _weather_near_miss_sample(
+    *,
+    raw_market: dict[str, Any],
+    parsed: ParsedWeatherContract,
+    rejection_reasons: list[str],
+) -> dict[str, Any]:
+    tags = raw_market.get("tags")
+    normalized_tags: list[str] = []
+    if isinstance(tags, list):
+        normalized_tags = [str(item) for item in tags[:5]]
+    title = _first_market_string(raw_market, ("title", "market_title", "name")) or ""
+    return {
+        "ticker": _first_market_string(raw_market, ("ticker", "symbol", "market_id", "id")),
+        "title": title[:120],
+        "category": _first_market_string(
+            raw_market,
+            ("category", "series", "event_category", "group"),
+        ),
+        "tags": normalized_tags,
+        "status": _first_market_string(raw_market, ("status", "market_status")),
+        "parse_status": parsed.parse_status,
+        "rejection_reasons": rejection_reasons,
+    }
+
+
 def _evaluate_signal_candidates(
     *,
     args: argparse.Namespace,
@@ -187,6 +276,9 @@ def _evaluate_signal_candidates(
 
     evaluations: list[SignalEvaluation] = []
     eval_by_market_id: dict[str, SignalEvaluation] = {}
+    weather_rejection_reasons: Counter[str] = Counter()
+    parse_status_counts: Counter[str] = Counter()
+    near_miss_samples: list[dict[str, Any]] = []
 
     for raw_market in market_records[:scan_limit]:
         parsed = parser.parse_market(raw_market)
@@ -210,6 +302,21 @@ def _evaluate_signal_candidates(
         )
         evaluations.append(evaluation)
         eval_by_market_id[market_id] = evaluation
+        parse_status_counts[parsed.parse_status] += 1
+        rejection_reasons = _weather_filter_rejection_reasons(
+            raw_market=raw_market,
+            parsed=parsed,
+        )
+        if rejection_reasons:
+            weather_rejection_reasons.update(rejection_reasons)
+            if len(near_miss_samples) < _MAX_WEATHER_DIAGNOSTIC_SAMPLES:
+                near_miss_samples.append(
+                    _weather_near_miss_sample(
+                        raw_market=raw_market,
+                        parsed=parsed,
+                        rejection_reasons=rejection_reasons,
+                    )
+                )
 
     selection = selector.select(
         evaluations,
@@ -266,7 +373,37 @@ def _evaluate_signal_candidates(
             1 for item in evaluations if item.parsed_contract.weather_candidate
         ),
         "candidates_generated": len(candidates),
+        "had_more_pages": int(bool(market_fetch.get("had_more_pages", False))),
+        "deduped_count": int(market_fetch.get("deduped_count", 0)),
     }
+    weather_candidates = counts["weather_candidates"]
+    excluded_count = max(0, len(evaluations) - weather_candidates)
+    reason_counts = dict(weather_rejection_reasons.most_common())
+    logger.info(
+        "Weather filter diagnostics: scanned=%d weather_markets_after_filter=%d "
+        "excluded=%d reasons=%s",
+        len(evaluations),
+        weather_candidates,
+        excluded_count,
+        reason_counts,
+    )
+    if near_miss_samples:
+        logger.info(
+            "Weather filter near-miss samples (max=%d): %s",
+            _MAX_WEATHER_DIAGNOSTIC_SAMPLES,
+            near_miss_samples,
+        )
+    journal.write_event(
+        "micro_weather_filter_diagnostics",
+        payload={
+            "scanned": len(evaluations),
+            "weather_markets_after_filter": weather_candidates,
+            "excluded": excluded_count,
+            "reason_counts": reason_counts,
+            "parse_status_counts": dict(parse_status_counts),
+            "near_miss_samples": near_miss_samples,
+        },
+    )
     return candidates, selection.rejected, counts
 
 
@@ -327,6 +464,52 @@ def _run_dry_run_mode(
     return results, accepted
 
 
+def _initialize_dashboard(
+    *,
+    ui_mode: str,
+    console: Console,
+    logger: Any,
+    session_id: str,
+) -> TerminalDashboard | None:
+    """Best-effort rich dashboard setup with safe fallback to plain mode."""
+    if ui_mode != "rich":
+        return None
+    try:
+        dashboard = TerminalDashboard(console=console, session_id=session_id)
+        dashboard.attach_logger(logger)
+        return dashboard
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Failed to initialize rich dashboard; falling back to plain output: %s",
+            sanitize_text(str(exc)),
+        )
+        return None
+
+
+def _safe_dashboard_action(
+    dashboard: TerminalDashboard | None,
+    *,
+    logger: Any,
+    action_name: str,
+    action: Callable[[TerminalDashboard], None],
+) -> TerminalDashboard | None:
+    """Guard dashboard operations so UI failures never interrupt execution path."""
+    if dashboard is None:
+        return None
+    try:
+        action(dashboard)
+        return dashboard
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Dashboard failure during %s; switching to plain output: %s",
+            action_name,
+            sanitize_text(str(exc)),
+        )
+        with suppress(Exception):
+            dashboard.detach_logger()
+        return None
+
+
 def _print_micro_attempts(
     console: Console,
     attempts: list[MicroOrderAttempt],
@@ -359,6 +542,7 @@ def main() -> int:
     console = Console()
     session_id = uuid.uuid4().hex[:12]
     journal: JournalWriter | None = None
+    dashboard: TerminalDashboard | None = None
 
     if args.max_cycles <= 0:
         logger.error("--max-cycles must be > 0.")
@@ -397,15 +581,6 @@ def main() -> int:
     except ValueError as exc:
         logger.error("Day 7 startup mode validation failed: %s", sanitize_text(str(exc)))
         return 2
-    logger.info(
-        "Day 7 runtime state: config_mode=%s cli_mode=%s "
-        "effective_mode=%s dry_run=%s supervised=%s",
-        config_mode,
-        cli_mode,
-        mode,
-        effective_dry_run,
-        args.supervised,
-    )
     if mode == "live_micro":
         missing_flags: list[str] = []
         if not settings.allow_live_api:
@@ -427,6 +602,34 @@ def main() -> int:
             )
             return 2
 
+    dashboard = _initialize_dashboard(
+        ui_mode=args.ui_mode,
+        console=console,
+        logger=logger,
+        session_id=session_id,
+    )
+    dashboard = _safe_dashboard_action(
+        dashboard,
+        logger=logger,
+        action_name="startup render",
+        action=lambda d: d.render_startup(
+            mode=mode,
+            effective_dry_run=effective_dry_run,
+            supervised=args.supervised,
+            config_mode=config_mode,
+            cli_mode=cli_mode,
+        ),
+    )
+    logger.info(
+        "Day 7 runtime state: config_mode=%s cli_mode=%s "
+        "effective_mode=%s dry_run=%s supervised=%s",
+        config_mode,
+        cli_mode,
+        mode,
+        effective_dry_run,
+        args.supervised,
+    )
+
     max_trades_this_run = (
         args.max_trades_this_run
         if args.max_trades_this_run is not None
@@ -447,6 +650,7 @@ def main() -> int:
                 "cli_mode": cli_mode,
                 "effective_execution_mode": mode,
                 "effective_dry_run": effective_dry_run,
+                "ui_mode": args.ui_mode,
                 "max_cycles": args.max_cycles,
                 "max_trades_this_run": max_trades_this_run,
                 "supervised": args.supervised,
@@ -456,6 +660,40 @@ def main() -> int:
         )
     except JournalError as exc:
         logger.error("Failed to initialize day7 journal: %s", sanitize_text(str(exc)))
+        if dashboard is not None:
+            error_text = sanitize_text(str(exc))
+            dashboard = _safe_dashboard_action(
+                dashboard,
+                logger=logger,
+                action_name="journal init error event",
+                action=lambda d, message=error_text: d.record_event(
+                    severity="ERROR",
+                    message=f"Journal initialization failed: {message}",
+                ),
+            )
+            dashboard = _safe_dashboard_action(
+                dashboard,
+                logger=logger,
+                action_name="journal init summary render",
+                action=lambda d: d.render_end(
+                    mode=mode,
+                    effective_dry_run=effective_dry_run,
+                    supervised=args.supervised,
+                    total_counts=Counter(),
+                    final_summary={
+                        "open_positions_count": 0,
+                        "realized_pnl_cents": 0,
+                        "daily_gross_exposure_cents": 0,
+                        "gross_exposure_utilization": 0.0,
+                        "realized_loss_utilization": 0.0,
+                        "halted_early": True,
+                        "halt_reason": "journal_init_failed",
+                    },
+                    exit_code=3,
+                ),
+            )
+            if dashboard is not None:
+                dashboard.detach_logger()
         return 3
 
     exit_code = 0
@@ -465,6 +703,7 @@ def main() -> int:
     total_counts: Counter[str] = Counter()
     skip_reasons: Counter[str] = Counter()
     final_summary: dict[str, Any] = {}
+    cycle_data_failures = 0
 
     try:
         if mode == "live_micro":
@@ -475,12 +714,52 @@ def main() -> int:
             )
 
         for _cycle_index in range(1, args.max_cycles + 1):
-            candidates, rejections, counts = _evaluate_signal_candidates(
-                args=args,
-                settings=settings,
-                logger=logger,
-                journal=journal,
-            )
+            try:
+                candidates, rejections, counts = _evaluate_signal_candidates(
+                    args=args,
+                    settings=settings,
+                    logger=logger,
+                    journal=journal,
+                )
+            except (KalshiAPIError, WeatherProviderError) as exc:
+                cycle_data_failures += 1
+                logger.error(
+                    "Day 7 cycle %d/%d data fetch failed; continuing to next cycle: %s",
+                    _cycle_index,
+                    args.max_cycles,
+                    sanitize_text(str(exc)),
+                )
+                journal.write_event(
+                    "micro_cycle_data_failure",
+                    payload={
+                        "cycle_index": _cycle_index,
+                        "error": sanitize_text(str(exc)),
+                        "error_type": type(exc).__name__,
+                        "continue_next_cycle": _cycle_index < args.max_cycles,
+                    },
+                    metadata={"session_id": session_id},
+                )
+                if dashboard is not None:
+                    err_type = type(exc).__name__
+                    error_msg = sanitize_text(str(exc))
+                    def _record_cycle_failure(
+                        d: TerminalDashboard,
+                        idx: int = _cycle_index,
+                        msg: str = error_msg,
+                        err: str = err_type,
+                    ) -> None:
+                        d.record_event(
+                            severity="ERROR",
+                            message=f"Cycle {idx} data fetch failure: {msg}",
+                            dedupe_key=f"cycle_data_failure:{err}:{msg}",
+                        )
+                    dashboard = _safe_dashboard_action(
+                        dashboard,
+                        logger=logger,
+                        action_name="cycle data failure event",
+                        action=_record_cycle_failure,
+                    )
+                continue
             total_counts.update({
                 "cycles_processed": 1,
                 "candidates_seen": len(candidates),
@@ -494,6 +773,33 @@ def main() -> int:
                 "pages_fetched": counts.get("pages_fetched", 1),
                 "candidates_generated": counts.get("candidates_generated", len(candidates)),
             })
+            if counts.get("had_more_pages", 0):
+                total_counts.update({"pagination_cursor_seen_cycles": 1})
+            if dashboard is not None and counts.get("had_more_pages", 0):
+                dashboard = _safe_dashboard_action(
+                    dashboard,
+                    logger=logger,
+                    action_name="pagination cursor warning",
+                    action=lambda d: d.record_event(
+                        severity="WARN",
+                        message=(
+                            "Pagination cursor still present after fetch caps; "
+                            "additional pages remain."
+                        ),
+                        dedupe_key="warn:pagination_cursor_after_caps",
+                    ),
+                )
+            if dashboard is not None and counts.get("deduped_count", 0) > 0:
+                deduped_count = counts.get("deduped_count", 0)
+                dashboard = _safe_dashboard_action(
+                    dashboard,
+                    logger=logger,
+                    action_name="dedupe info event",
+                    action=lambda d, deduped=deduped_count: d.record_event(
+                        severity="INFO",
+                        message=f"Market dedupe removed {deduped} duplicates.",
+                    ),
+                )
             logger.info(
                 "Day 7 cycle diagnostics: pages_fetched=%d total_markets_fetched=%d "
                 "weather_markets_after_filter=%d candidates_generated=%d",
@@ -516,6 +822,8 @@ def main() -> int:
                         counts.get("weather_candidates", 0),
                     ),
                     "candidates_generated": counts.get("candidates_generated", len(candidates)),
+                    "had_more_pages": bool(counts.get("had_more_pages", 0)),
+                    "deduped_count": counts.get("deduped_count", 0),
                     "signal_scanned": counts["scanned"],
                     "signal_filtered": counts["filtered"],
                     "selected": counts.get("selected", len(candidates)),
@@ -563,6 +871,34 @@ def main() -> int:
                     "trades_per_run_utilization": accepted / max_trades_this_run,
                     "trades_per_day_utilization": 0.0,
                 }
+                if dashboard is not None:
+                    cycle_index = _cycle_index
+                    cycle_counts = dict(counts)
+                    cycle_summary = dict(final_summary)
+                    def _render_cycle(
+                        d: TerminalDashboard,
+                        idx: int = cycle_index,
+                        c: dict[str, int] = cycle_counts,
+                        s: dict[str, Any] = cycle_summary,
+                    ) -> None:
+                        d.render_cycle(
+                            cycle_index=idx,
+                            max_cycles=args.max_cycles,
+                            mode=mode,
+                            effective_dry_run=effective_dry_run,
+                            supervised=args.supervised,
+                            counts=c,
+                            total_counts=total_counts,
+                            final_summary=s,
+                            skip_reasons=skip_reasons,
+                            attempts=attempts_all,
+                        )
+                    dashboard = _safe_dashboard_action(
+                        dashboard,
+                        logger=logger,
+                        action_name="cycle render",
+                        action=_render_cycle,
+                    )
                 continue
 
             if micro_runner is None:  # pragma: no cover - defensive
@@ -591,6 +927,34 @@ def main() -> int:
             )
             skip_reasons.update(summary.skip_reasons)
             final_summary = summary.model_dump(mode="json")
+            if dashboard is not None:
+                cycle_index = _cycle_index
+                cycle_counts = dict(counts)
+                cycle_summary = dict(final_summary)
+                def _render_cycle(
+                    d: TerminalDashboard,
+                    idx: int = cycle_index,
+                    c: dict[str, int] = cycle_counts,
+                    s: dict[str, Any] = cycle_summary,
+                ) -> None:
+                    d.render_cycle(
+                        cycle_index=idx,
+                        max_cycles=args.max_cycles,
+                        mode=mode,
+                        effective_dry_run=effective_dry_run,
+                        supervised=args.supervised,
+                        counts=c,
+                        total_counts=total_counts,
+                        final_summary=s,
+                        skip_reasons=skip_reasons,
+                        attempts=attempts_all,
+                    )
+                dashboard = _safe_dashboard_action(
+                    dashboard,
+                    logger=logger,
+                    action_name="cycle render",
+                    action=_render_cycle,
+                )
 
             if summary.halted_early:
                 exit_code = 4
@@ -598,44 +962,49 @@ def main() -> int:
 
         if mode == "live_micro" and total_counts["unresolved"] > 0:
             exit_code = 4
+        if cycle_data_failures > 0 and total_counts["cycles_processed"] == 0 and exit_code == 0:
+            exit_code = 4
 
-        summary_line = (
-            f"mode={mode} cycles={total_counts['cycles_processed']} "
-            f"pages_fetched={total_counts['pages_fetched']} "
-            f"total_markets_fetched={total_counts['total_markets_fetched']} "
-            f"weather_markets_after_filter={total_counts['weather_markets_after_filter']} "
-            f"signal_scanned={total_counts['signal_scanned']} "
-            f"candidates_generated={total_counts['candidates_generated']} "
-            f"candidates_seen={total_counts['candidates_seen']} "
-            f"trades_allowed={total_counts['trades_allowed']} "
-            f"trades_skipped={total_counts['trades_skipped']} "
-            f"orders_submitted={total_counts['orders_submitted']} "
-            f"fills={total_counts['fills']} "
-            f"partial_fills={total_counts['partial_fills']} "
-            f"cancels={total_counts['cancels']} "
-            f"rejects={total_counts['rejects']} "
-            f"unresolved={total_counts['unresolved']}"
-        )
-        console.print(summary_line)
-        if attempts_all:
-            _print_micro_attempts(console, attempts_all, max_rows=10)
-
-        if skip_reasons:
-            top_reasons = ", ".join(
-                f"{reason}:{count}" for reason, count in skip_reasons.most_common(5)
+        if dashboard is None:
+            summary_line = (
+                f"mode={mode} cycles={total_counts['cycles_processed']} "
+                f"cycle_data_failures={cycle_data_failures} "
+                f"pages_fetched={total_counts['pages_fetched']} "
+                f"total_markets_fetched={total_counts['total_markets_fetched']} "
+                f"weather_markets_after_filter={total_counts['weather_markets_after_filter']} "
+                f"signal_scanned={total_counts['signal_scanned']} "
+                f"candidates_generated={total_counts['candidates_generated']} "
+                f"candidates_seen={total_counts['candidates_seen']} "
+                f"trades_allowed={total_counts['trades_allowed']} "
+                f"trades_skipped={total_counts['trades_skipped']} "
+                f"orders_submitted={total_counts['orders_submitted']} "
+                f"fills={total_counts['fills']} "
+                f"partial_fills={total_counts['partial_fills']} "
+                f"cancels={total_counts['cancels']} "
+                f"rejects={total_counts['rejects']} "
+                f"unresolved={total_counts['unresolved']}"
             )
-            console.print(f"skip_reasons={top_reasons}")
+            console.print(summary_line)
+            if attempts_all:
+                _print_micro_attempts(console, attempts_all, max_rows=10)
 
-        if final_summary:
-            console.print(
-                f"open_positions={final_summary.get('open_positions_count', 0)} "
-                f"realized_pnl_cents={final_summary.get('realized_pnl_cents', 0)} "
-                f"daily_gross_exposure_cents={final_summary.get('daily_gross_exposure_cents', 0)} "
-                f"gross_util={final_summary.get('gross_exposure_utilization', 0.0)} "
-                f"loss_util={final_summary.get('realized_loss_utilization', 0.0)} "
-                f"halted_early={final_summary.get('halted_early', False)} "
-                f"halt_reason={final_summary.get('halt_reason') or '-'}"
-            )
+            if skip_reasons:
+                top_reasons = ", ".join(
+                    f"{reason}:{count}" for reason, count in skip_reasons.most_common(5)
+                )
+                console.print(f"skip_reasons={top_reasons}")
+
+            if final_summary:
+                console.print(
+                    f"open_positions={final_summary.get('open_positions_count', 0)} "
+                    f"realized_pnl_cents={final_summary.get('realized_pnl_cents', 0)} "
+                    "daily_gross_exposure_cents="
+                    f"{final_summary.get('daily_gross_exposure_cents', 0)} "
+                    f"gross_util={final_summary.get('gross_exposure_utilization', 0.0)} "
+                    f"loss_util={final_summary.get('realized_loss_utilization', 0.0)} "
+                    f"halted_early={final_summary.get('halted_early', False)} "
+                    f"halt_reason={final_summary.get('halt_reason') or '-'}"
+                )
 
         journal.write_event(
             "micro_session_summary",
@@ -643,6 +1012,7 @@ def main() -> int:
                 "mode": mode,
                 "effective_dry_run": effective_dry_run,
                 "cycles_processed": total_counts["cycles_processed"],
+                "cycle_data_failures": cycle_data_failures,
                 "pages_fetched": total_counts["pages_fetched"],
                 "total_markets_fetched": total_counts["total_markets_fetched"],
                 "weather_markets_after_filter": total_counts["weather_markets_after_filter"],
@@ -671,7 +1041,20 @@ def main() -> int:
         JournalError,
     ) as exc:
         exit_code = 4
-        logger.error("Day 7 session failed: %s", sanitize_text(str(exc)))
+        error_text = sanitize_text(str(exc))
+        error_type = type(exc).__name__
+        logger.error("Day 7 session failed: %s", error_text)
+        if dashboard is not None:
+            dashboard = _safe_dashboard_action(
+                dashboard,
+                logger=logger,
+                action_name="failure event",
+                action=lambda d, message=error_text, err_type=error_type: d.record_event(
+                    severity="ERROR",
+                    message=f"Session failure: {message}",
+                    dedupe_key=f"error:{err_type}:{message}",
+                ),
+            )
         try:
             journal.write_event(
                 "micro_session_failure",
@@ -682,7 +1065,18 @@ def main() -> int:
             logger.error("Failed to write micro_session_failure event.")
     except Exception as exc:  # pragma: no cover - defensive runtime guard
         exit_code = 99
-        logger.exception("Unexpected Day 7 failure: %s", sanitize_text(str(exc)))
+        error_text = sanitize_text(str(exc))
+        logger.exception("Unexpected Day 7 failure: %s", error_text)
+        if dashboard is not None:
+            dashboard = _safe_dashboard_action(
+                dashboard,
+                logger=logger,
+                action_name="unhandled failure event",
+                action=lambda d, message=error_text: d.record_event(
+                    severity="CRITICAL",
+                    message=f"Unhandled failure: {message}",
+                ),
+            )
         try:
             journal.write_event(
                 "micro_session_failure_unhandled",
@@ -703,6 +1097,32 @@ def main() -> int:
                 )
             except JournalError:
                 logger.error("Failed to write micro_session_shutdown event.")
+        if dashboard is not None:
+            if not final_summary:
+                final_summary = {
+                    "open_positions_count": 0,
+                    "realized_pnl_cents": 0,
+                    "daily_gross_exposure_cents": 0,
+                    "gross_exposure_utilization": 0.0,
+                    "realized_loss_utilization": 0.0,
+                    "halted_early": exit_code != 0,
+                    "halt_reason": None,
+                }
+            dashboard = _safe_dashboard_action(
+                dashboard,
+                logger=logger,
+                action_name="final summary render",
+                action=lambda d: d.render_end(
+                    mode=mode,
+                    effective_dry_run=effective_dry_run,
+                    supervised=args.supervised,
+                    total_counts=total_counts,
+                    final_summary=final_summary,
+                    exit_code=exit_code,
+                ),
+            )
+            if dashboard is not None:
+                dashboard.detach_logger()
 
     return exit_code
 

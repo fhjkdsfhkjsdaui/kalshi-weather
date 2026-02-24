@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     kalshi_max_pages_per_fetch: int = Field(default=10, alias="KALSHI_MAX_PAGES_PER_FETCH")
     kalshi_max_markets_fetch: int = Field(default=2000, alias="KALSHI_MAX_MARKETS_FETCH")
     kalshi_page_sleep_ms: int = Field(default=100, alias="KALSHI_PAGE_SLEEP_MS")
+    kalshi_page_fetch_max_retries: int = Field(
+        default=2,
+        alias="KALSHI_PAGE_FETCH_MAX_RETRIES",
+    )
+    kalshi_page_retry_base_ms: int = Field(default=250, alias="KALSHI_PAGE_RETRY_BASE_MS")
+    kalshi_page_retry_jitter_ms: int = Field(default=100, alias="KALSHI_PAGE_RETRY_JITTER_MS")
 
     journal_dir: Path = Field(default=Path("./data/journal"), alias="JOURNAL_DIR")
     raw_payload_dir: Path = Field(default=Path("./data/raw"), alias="RAW_PAYLOAD_DIR")
@@ -122,7 +128,7 @@ class Settings(BaseSettings):
     )
     signal_min_edge: float = Field(default=0.03, alias="SIGNAL_MIN_EDGE")
     signal_max_candidates: int = Field(default=3, alias="SIGNAL_MAX_CANDIDATES")
-    signal_max_markets_to_scan: int = Field(default=250, alias="SIGNAL_MAX_MARKETS_TO_SCAN")
+    signal_max_markets_to_scan: int = Field(default=1000, alias="SIGNAL_MAX_MARKETS_TO_SCAN")
     signal_staleness_override_seconds: int | None = Field(
         default=None,
         alias="SIGNAL_STALENESS_OVERRIDE_SECONDS",
@@ -287,6 +293,12 @@ class Settings(BaseSettings):
             raise ValueError("KALSHI_MAX_MARKETS_FETCH must be > 0.")
         if self.kalshi_page_sleep_ms < 0:
             raise ValueError("KALSHI_PAGE_SLEEP_MS must be >= 0.")
+        if self.kalshi_page_fetch_max_retries < 0:
+            raise ValueError("KALSHI_PAGE_FETCH_MAX_RETRIES must be >= 0.")
+        if self.kalshi_page_retry_base_ms < 0:
+            raise ValueError("KALSHI_PAGE_RETRY_BASE_MS must be >= 0.")
+        if self.kalshi_page_retry_jitter_ms < 0:
+            raise ValueError("KALSHI_PAGE_RETRY_JITTER_MS must be >= 0.")
         if not self.nws_user_agent.strip():
             raise ValueError("NWS_USER_AGENT must not be empty.")
         if self.weather_timeout_seconds <= 0:
@@ -449,6 +461,9 @@ class Settings(BaseSettings):
             "kalshi_max_pages_per_fetch": self.kalshi_max_pages_per_fetch,
             "kalshi_max_markets_fetch": self.kalshi_max_markets_fetch,
             "kalshi_page_sleep_ms": self.kalshi_page_sleep_ms,
+            "kalshi_page_fetch_max_retries": self.kalshi_page_fetch_max_retries,
+            "kalshi_page_retry_base_ms": self.kalshi_page_retry_base_ms,
+            "kalshi_page_retry_jitter_ms": self.kalshi_page_retry_jitter_ms,
             "orders_endpoint": self.kalshi_orders_endpoint,
             "weather_timeout_seconds": self.weather_timeout_seconds,
             "weather_raw_journaling": self.weather_journal_raw_payloads,

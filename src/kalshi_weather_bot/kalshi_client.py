@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import random
 import re
 import time
 from datetime import UTC, datetime
@@ -129,10 +130,12 @@ class KalshiClient:
         effective_limit = limit or self.settings.kalshi_default_limit
         params: dict[str, Any] = {"limit": effective_limit}
         # TODO(KALSHI_API): confirm if status/open filter query params are supported.
-        first_payload = self._request_json(
-            "GET",
-            self.settings.kalshi_markets_endpoint,
+        first_payload = self._request_markets_page_with_retry(
             params=params,
+            page_index=1,
+            cursor_present=False,
+            pages_fetched_so_far=0,
+            total_markets_fetched_so_far=0,
         )
 
         # Preserve legacy behavior for list payloads (no cursor metadata expected).
@@ -192,10 +195,12 @@ class KalshiClient:
                     )
                     break
                 seen_cursors.add(next_cursor)
-                page_payload = self._request_json(
-                    "GET",
-                    self.settings.kalshi_markets_endpoint,
+                page_payload = self._request_markets_page_with_retry(
                     params={"limit": effective_limit, "cursor": next_cursor},
+                    page_index=pages_fetched + 1,
+                    cursor_present=True,
+                    pages_fetched_so_far=pages_fetched,
+                    total_markets_fetched_so_far=len(deduped_records),
                 )
                 if not isinstance(page_payload, dict):
                     raise KalshiAPIError(
@@ -397,6 +402,63 @@ class KalshiClient:
         if isinstance(value, bool):
             return default
         return value if isinstance(value, int) and value >= 0 else default
+
+    def _request_markets_page_with_retry(
+        self,
+        *,
+        params: dict[str, Any],
+        page_index: int,
+        cursor_present: bool,
+        pages_fetched_so_far: int,
+        total_markets_fetched_so_far: int,
+    ) -> dict[str, Any] | list[Any]:
+        """Fetch one markets page with page-scoped retry/backoff diagnostics."""
+        max_retries = self._get_non_negative_int_setting("kalshi_page_fetch_max_retries", 2)
+        base_ms = self._get_non_negative_int_setting("kalshi_page_retry_base_ms", 250)
+        jitter_ms = self._get_non_negative_int_setting("kalshi_page_retry_jitter_ms", 100)
+
+        last_error: KalshiRequestError | None = None
+        attempts_used = 0
+        for attempt in range(max_retries + 1):
+            attempts_used = attempt + 1
+            try:
+                return self._request_json(
+                    "GET",
+                    self.settings.kalshi_markets_endpoint,
+                    params=params,
+                )
+            except KalshiRequestError as exc:
+                last_error = exc
+                retryable = exc.category in {"network", "rate_limit", "server", "unknown"}
+                if retryable and attempt < max_retries:
+                    backoff_ms = base_ms * (2 ** attempt)
+                    jitter = random.randint(0, jitter_ms) if jitter_ms > 0 else 0
+                    delay_seconds = (backoff_ms + jitter) / 1000.0
+                    self.logger.warning(
+                        "Kalshi markets page request failed; retrying page=%d attempt=%d/%d "
+                        "category=%s status=%s delay_ms=%d",
+                        page_index,
+                        attempt + 1,
+                        max_retries + 1,
+                        exc.category,
+                        exc.status_code,
+                        int(backoff_ms + jitter),
+                    )
+                    if delay_seconds > 0:
+                        time.sleep(delay_seconds)
+                    continue
+                break
+
+        error_message = (
+            "Kalshi paginated markets fetch failed after retries "
+            f"(page_index={page_index} cursor_present={cursor_present} "
+            f"pages_fetched_so_far={pages_fetched_so_far} "
+            f"total_markets_fetched_so_far={total_markets_fetched_so_far} "
+            f"attempts_used={attempts_used}): "
+            f"{sanitize_text(str(last_error)) if last_error else 'unknown error'}"
+        )
+        self.logger.error(error_message)
+        raise KalshiAPIError(error_message) from last_error
 
     def filter_open_weather_markets(self, markets: list[MarketSummary]) -> list[MarketSummary]:
         """Return markets that appear to be both weather-related and currently open."""
