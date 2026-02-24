@@ -16,3 +16,9 @@ data/
 
 # Private keys
 *.pem
+# Claude local settings (optional local-only)
+.claude/
+
+# Key material
+*.key
+*.pem
