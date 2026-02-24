@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from datetime import UTC, datetime, timedelta
@@ -925,6 +926,381 @@ def test_cli_dry_run_flag_forces_dry_run_mode(
     assert exit_code == 0
     output = capsys.readouterr().out
     assert "mode=dry_run" in output
+
+
+def test_cli_live_micro_mode_overrides_conflicting_config(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    _set_required_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("EXECUTION_MODE", "dry_run")
+
+    captured_mode: dict[str, str] = {}
+
+    def _fake_eval(
+        *, args: Any, settings: Any, logger: Any, journal: Any
+    ) -> tuple[Any, Any, Any]:
+        del args, settings, logger, journal
+        return [], [], {
+            "scanned": 0,
+            "weather_candidates": 0,
+            "matched": 0,
+            "estimated": 0,
+            "filtered": 0,
+            "selected": 0,
+        }
+
+    class _FakeRunner:
+        def run_candidates(self, **kwargs: Any) -> MicroSessionResult:
+            del kwargs
+            snapshot = PositionSnapshot(
+                open_positions=[],
+                open_positions_count=0,
+                daily_gross_exposure_cents=0,
+                daily_realized_pnl_cents=0,
+                trades_executed_today=0,
+                last_trade_ts=None,
+            )
+            summary = MicroSessionSummary(
+                cycles_processed=1,
+                candidates_seen=0,
+                trades_allowed=0,
+                trades_skipped=0,
+                skip_reasons={},
+                orders_submitted=0,
+                fills=0,
+                partial_fills=0,
+                cancels=0,
+                rejects=0,
+                unresolved=0,
+                open_positions_count=0,
+                realized_pnl_cents=0,
+                daily_gross_exposure_cents=0,
+                gross_exposure_utilization=0.0,
+                realized_loss_utilization=0.0,
+                trades_per_run_utilization=0.0,
+                trades_per_day_utilization=0.0,
+                halted_early=False,
+            )
+            return MicroSessionResult(attempts=[], position_snapshot=snapshot, summary=summary)
+
+    class _FakeClient:
+        def close(self) -> None:
+            return
+
+    def _fake_build_runner(*, settings: Any, logger: Any, journal: Any) -> tuple[Any, Any]:
+        del logger, journal
+        captured_mode["execution_mode"] = settings.execution_mode
+        return _FakeRunner(), _FakeClient()
+
+    monkeypatch.setattr(day7_cli, "_evaluate_signal_candidates", _fake_eval)
+    monkeypatch.setattr(day7_cli, "_build_live_micro_runner", _fake_build_runner)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kalshi-weather-day7",
+            "--mode",
+            "live_micro",
+            "--no-dry-run",
+            "--supervised",
+            "--max-cycles",
+            "1",
+        ],
+    )
+    exit_code = day7_cli.main()
+    assert exit_code == 0
+    assert captured_mode["execution_mode"] == "live_micro"
+    output = capsys.readouterr().out
+    assert "mode=live_micro" in output
+
+
+def test_cli_live_micro_mode_overrides_live_cancel_only_config(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    _set_required_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("EXECUTION_MODE", "live_cancel_only")
+    monkeypatch.setenv("CANCEL_ONLY_ENABLED", "true")
+
+    captured_mode: dict[str, str] = {}
+
+    def _fake_eval(
+        *, args: Any, settings: Any, logger: Any, journal: Any
+    ) -> tuple[Any, Any, Any]:
+        del args, settings, logger, journal
+        return [], [], {
+            "scanned": 0,
+            "weather_candidates": 0,
+            "matched": 0,
+            "estimated": 0,
+            "filtered": 0,
+            "selected": 0,
+        }
+
+    class _FakeRunner:
+        def run_candidates(self, **kwargs: Any) -> MicroSessionResult:
+            del kwargs
+            snapshot = PositionSnapshot(
+                open_positions=[],
+                open_positions_count=0,
+                daily_gross_exposure_cents=0,
+                daily_realized_pnl_cents=0,
+                trades_executed_today=0,
+                last_trade_ts=None,
+            )
+            summary = MicroSessionSummary(
+                cycles_processed=1,
+                candidates_seen=0,
+                trades_allowed=0,
+                trades_skipped=0,
+                skip_reasons={},
+                orders_submitted=0,
+                fills=0,
+                partial_fills=0,
+                cancels=0,
+                rejects=0,
+                unresolved=0,
+                open_positions_count=0,
+                realized_pnl_cents=0,
+                daily_gross_exposure_cents=0,
+                gross_exposure_utilization=0.0,
+                realized_loss_utilization=0.0,
+                trades_per_run_utilization=0.0,
+                trades_per_day_utilization=0.0,
+                halted_early=False,
+            )
+            return MicroSessionResult(attempts=[], position_snapshot=snapshot, summary=summary)
+
+    class _FakeClient:
+        def close(self) -> None:
+            return
+
+    def _fake_build_runner(*, settings: Any, logger: Any, journal: Any) -> tuple[Any, Any]:
+        del logger, journal
+        captured_mode["execution_mode"] = settings.execution_mode
+        return _FakeRunner(), _FakeClient()
+
+    monkeypatch.setattr(day7_cli, "_evaluate_signal_candidates", _fake_eval)
+    monkeypatch.setattr(day7_cli, "_build_live_micro_runner", _fake_build_runner)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kalshi-weather-day7",
+            "--mode",
+            "live_micro",
+            "--no-dry-run",
+            "--supervised",
+            "--max-cycles",
+            "1",
+        ],
+    )
+    exit_code = day7_cli.main()
+    assert exit_code == 0
+    assert captured_mode["execution_mode"] == "live_micro"
+    output = capsys.readouterr().out
+    assert "mode=live_micro" in output
+
+
+def test_cli_live_micro_with_dry_run_conflict_fails_before_side_effects(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    _set_required_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("EXECUTION_MODE", "dry_run")
+
+    called = {"build_runner": False, "evaluate": False}
+
+    def _fake_eval(
+        *, args: Any, settings: Any, logger: Any, journal: Any
+    ) -> tuple[Any, Any, Any]:
+        del args, settings, logger, journal
+        called["evaluate"] = True
+        return [], [], {
+            "scanned": 0,
+            "weather_candidates": 0,
+            "matched": 0,
+            "estimated": 0,
+            "filtered": 0,
+            "selected": 0,
+        }
+
+    def _fake_build_runner(*, settings: Any, logger: Any, journal: Any) -> tuple[Any, Any]:
+        del settings, logger, journal
+        called["build_runner"] = True
+        raise AssertionError("Runner should not be built on startup conflict.")
+
+    monkeypatch.setattr(day7_cli, "_evaluate_signal_candidates", _fake_eval)
+    monkeypatch.setattr(day7_cli, "_build_live_micro_runner", _fake_build_runner)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kalshi-weather-day7",
+            "--mode",
+            "live_micro",
+            "--dry-run",
+            "--supervised",
+            "--max-cycles",
+            "1",
+        ],
+    )
+    exit_code = day7_cli.main()
+    assert exit_code == 2
+    assert called["build_runner"] is False
+    assert called["evaluate"] is False
+    stderr = capsys.readouterr().err.lower()
+    assert "config execution_mode=dry_run" in stderr
+    assert "conflicting runtime flags" in stderr
+    assert "cli --mode=live_micro" in stderr
+    assert "use --no-dry-run" in stderr
+
+
+def test_cli_live_micro_no_dry_run_startup_journal_has_effective_state(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _set_required_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("EXECUTION_MODE", "dry_run")
+
+    def _fake_eval(
+        *, args: Any, settings: Any, logger: Any, journal: Any
+    ) -> tuple[Any, Any, Any]:
+        del args, settings, logger, journal
+        return [], [], {
+            "scanned": 0,
+            "weather_candidates": 0,
+            "matched": 0,
+            "estimated": 0,
+            "filtered": 0,
+            "selected": 0,
+        }
+
+    class _FakeRunner:
+        def run_candidates(self, **kwargs: Any) -> MicroSessionResult:
+            del kwargs
+            snapshot = PositionSnapshot(
+                open_positions=[],
+                open_positions_count=0,
+                daily_gross_exposure_cents=0,
+                daily_realized_pnl_cents=0,
+                trades_executed_today=0,
+                last_trade_ts=None,
+            )
+            summary = MicroSessionSummary(
+                cycles_processed=1,
+                candidates_seen=0,
+                trades_allowed=0,
+                trades_skipped=0,
+                skip_reasons={},
+                orders_submitted=0,
+                fills=0,
+                partial_fills=0,
+                cancels=0,
+                rejects=0,
+                unresolved=0,
+                open_positions_count=0,
+                realized_pnl_cents=0,
+                daily_gross_exposure_cents=0,
+                gross_exposure_utilization=0.0,
+                realized_loss_utilization=0.0,
+                trades_per_run_utilization=0.0,
+                trades_per_day_utilization=0.0,
+                halted_early=False,
+            )
+            return MicroSessionResult(attempts=[], position_snapshot=snapshot, summary=summary)
+
+    class _FakeClient:
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr(day7_cli, "_evaluate_signal_candidates", _fake_eval)
+    monkeypatch.setattr(
+        day7_cli,
+        "_build_live_micro_runner",
+        lambda settings, logger, journal: (_FakeRunner(), _FakeClient()),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kalshi-weather-day7",
+            "--mode",
+            "live_micro",
+            "--no-dry-run",
+            "--supervised",
+            "--max-cycles",
+            "1",
+        ],
+    )
+    exit_code = day7_cli.main()
+    assert exit_code == 0
+
+    journal_files = sorted((tmp_path / "journal").glob("*.jsonl"))
+    assert journal_files
+    lines = journal_files[0].read_text(encoding="utf-8").splitlines()
+    startup_events = [json.loads(line) for line in lines if line.strip()]
+    start_event = next(
+        item for item in startup_events if item["event_type"] == "micro_session_start"
+    )
+    payload = start_event["payload"]
+    assert payload["config_execution_mode"] == "dry_run"
+    assert payload["cli_mode"] == "live_micro"
+    assert payload["effective_execution_mode"] == "live_micro"
+    assert payload["effective_dry_run"] is False
+    assert payload["supervised"] is True
+
+
+def test_day7_cycle_summary_includes_fetch_diagnostics(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    _set_required_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("EXECUTION_MODE", "dry_run")
+
+    def _fake_eval(
+        *, args: Any, settings: Any, logger: Any, journal: Any
+    ) -> tuple[Any, Any, Any]:
+        del args, settings, logger, journal
+        return [], [], {
+            "scanned": 2,
+            "weather_candidates": 1,
+            "matched": 1,
+            "estimated": 1,
+            "filtered": 1,
+            "selected": 0,
+            "pages_fetched": 3,
+            "total_markets_fetched": 450,
+            "weather_markets_after_filter": 12,
+            "candidates_generated": 0,
+        }
+
+    monkeypatch.setattr(day7_cli, "_evaluate_signal_candidates", _fake_eval)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kalshi-weather-day7",
+            "--dry-run",
+            "--max-cycles",
+            "1",
+        ],
+    )
+
+    exit_code = day7_cli.main()
+    assert exit_code == 0
+
+    journal_files = sorted((tmp_path / "journal").glob("*.jsonl"))
+    assert journal_files
+    events = [
+        json.loads(line)
+        for line in journal_files[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    cycle_event = next(
+        item for item in events if item["event_type"] == "micro_cycle_signal_summary"
+    )
+    payload = cycle_event["payload"]
+    assert payload["pages_fetched"] == 3
+    assert payload["total_markets_fetched"] == 450
+    assert payload["weather_markets_after_filter"] == 12
+    assert payload["candidates_generated"] == 0
 
 
 # --- CRITICAL severity journal event for unexpected fill state ---

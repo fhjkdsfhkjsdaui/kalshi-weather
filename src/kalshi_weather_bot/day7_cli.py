@@ -18,7 +18,7 @@ from .contracts.parser import KalshiWeatherContractParser
 from .day5_cli import (
     _market_liquidity,
     _market_spread_cents,
-    _resolve_market_records,
+    _resolve_market_records_with_diagnostics,
     _resolve_weather_snapshot,
 )
 from .exceptions import (
@@ -106,6 +106,56 @@ def _combine_scope_filters(settings: Settings, args: argparse.Namespace) -> str 
     return ",".join(deduped)
 
 
+def _resolve_runtime_mode(
+    *,
+    settings: Settings,
+    args: argparse.Namespace,
+    logger: Any,
+) -> tuple[Settings, str, bool]:
+    """Resolve effective execution mode for this CLI run with safe, explicit precedence."""
+    config_mode = settings.execution_mode
+    cli_mode = args.mode
+    effective_mode = cli_mode if cli_mode is not None else config_mode
+
+    if args.dry_run is True:
+        effective_dry_run = True
+    elif args.dry_run is False:
+        effective_dry_run = False
+    else:
+        effective_dry_run = effective_mode == "dry_run"
+
+    if cli_mode is not None and cli_mode != config_mode:
+        logger.warning(
+            "Execution mode mismatch: config EXECUTION_MODE=%s, CLI --mode=%s. "
+            "Using CLI mode for this run. To keep consistent, set EXECUTION_MODE=%s in .env.",
+            config_mode,
+            cli_mode,
+            cli_mode,
+        )
+
+    if cli_mode == "live_micro" and effective_dry_run:
+        raise ValueError(
+            "Conflicting runtime flags: config EXECUTION_MODE="
+            f"{config_mode}, CLI --mode=live_micro, effective dry_run=true. "
+            "Use --no-dry-run for live micro execution."
+        )
+
+    if effective_dry_run:
+        effective_mode = "dry_run"
+
+    if effective_mode == "live_cancel_only":
+        raise ValueError("Day 7 CLI does not run cancel-only mode; use kalshi-weather-day6.")
+
+    if not effective_dry_run and effective_mode != "live_micro":
+        raise ValueError(
+            "Invalid runtime mode: dry_run=false requires live_micro mode. "
+            f"config EXECUTION_MODE={config_mode}, CLI --mode={cli_mode!r}."
+        )
+
+    runtime_settings = settings.model_copy(update={"execution_mode": effective_mode})
+    return runtime_settings, effective_mode, effective_dry_run
+
+
 def _evaluate_signal_candidates(
     *,
     args: argparse.Namespace,
@@ -115,7 +165,7 @@ def _evaluate_signal_candidates(
 ) -> tuple[list[MicroTradeCandidate], list[SignalRejection], dict[str, int]]:
     now = datetime.now(UTC)
     scan_limit = args.max_markets_to_scan or settings.signal_max_markets_to_scan
-    market_records = _resolve_market_records(
+    market_records, market_fetch = _resolve_market_records_with_diagnostics(
         args=args,
         settings=settings,
         logger=logger,
@@ -208,6 +258,14 @@ def _evaluate_signal_candidates(
         "estimated": sum(1 for item in evaluations if item.estimate_result.available),
         "filtered": len(selection.rejected),
         "selected": len(selection.selected),
+        "total_markets_fetched": int(
+            market_fetch.get("total_markets_fetched", len(market_records))
+        ),
+        "pages_fetched": int(market_fetch.get("pages_fetched", 1)),
+        "weather_markets_after_filter": sum(
+            1 for item in evaluations if item.parsed_contract.weather_candidate
+        ),
+        "candidates_generated": len(candidates),
     }
     return candidates, selection.rejected, counts
 
@@ -328,17 +386,52 @@ def main() -> int:
     if scope != settings.micro_market_scope_whitelist:
         settings = settings.model_copy(update={"micro_market_scope_whitelist": scope})
 
-    mode = args.mode or settings.execution_mode
-    if args.dry_run is True:
-        mode = "dry_run"
-    if args.dry_run is False and mode == "dry_run":
-        logger.error("--no-dry-run requires --mode live_micro.")
+    config_mode = settings.execution_mode
+    cli_mode = args.mode
+    try:
+        settings, mode, effective_dry_run = _resolve_runtime_mode(
+            settings=settings,
+            args=args,
+            logger=logger,
+        )
+    except ValueError as exc:
+        logger.error("Day 7 startup mode validation failed: %s", sanitize_text(str(exc)))
         return 2
-    if mode == "live_cancel_only":
-        logger.error("Day 7 CLI does not run cancel-only mode; use kalshi-weather-day6.")
-        return 2
+    logger.info(
+        "Day 7 runtime state: config_mode=%s cli_mode=%s "
+        "effective_mode=%s dry_run=%s supervised=%s",
+        config_mode,
+        cli_mode,
+        mode,
+        effective_dry_run,
+        args.supervised,
+    )
+    if mode == "live_micro":
+        missing_flags: list[str] = []
+        if not settings.allow_live_api:
+            missing_flags.append("ALLOW_LIVE_API=true")
+        if not settings.allow_live_fills:
+            missing_flags.append("ALLOW_LIVE_FILLS=true")
+        if not settings.micro_mode_enabled:
+            missing_flags.append("MICRO_MODE_ENABLED=true")
+        if missing_flags:
+            logger.error(
+                "Unsafe live_micro startup: missing required guard flags for this run (%s). "
+                "Set these in .env or pass a safe mode (--dry-run).",
+                ", ".join(missing_flags),
+            )
+            return 2
+        if settings.micro_require_supervised_mode and not args.supervised:
+            logger.error(
+                "Unsafe startup: --supervised is required by MICRO_REQUIRE_SUPERVISED_MODE."
+            )
+            return 2
 
-    max_trades_this_run = args.max_trades_this_run or settings.micro_max_trades_per_run
+    max_trades_this_run = (
+        args.max_trades_this_run
+        if args.max_trades_this_run is not None
+        else settings.micro_max_trades_per_run
+    )
 
     try:
         journal = JournalWriter(
@@ -350,6 +443,10 @@ def main() -> int:
             "micro_session_start",
             payload={
                 "mode": mode,
+                "config_execution_mode": config_mode,
+                "cli_mode": cli_mode,
+                "effective_execution_mode": mode,
+                "effective_dry_run": effective_dry_run,
                 "max_cycles": args.max_cycles,
                 "max_trades_this_run": max_trades_this_run,
                 "supervised": args.supervised,
@@ -370,13 +467,6 @@ def main() -> int:
     final_summary: dict[str, Any] = {}
 
     try:
-        if mode == "live_micro" and settings.micro_require_supervised_mode and not args.supervised:
-            logger.error(
-                "Unsafe startup: --supervised is required by "
-                "MICRO_REQUIRE_SUPERVISED_MODE."
-            )
-            return 2
-
         if mode == "live_micro":
             micro_runner, client = _build_live_micro_runner(
                 settings=settings,
@@ -396,7 +486,42 @@ def main() -> int:
                 "candidates_seen": len(candidates),
                 "signal_scanned": counts["scanned"],
                 "signal_filtered": counts["filtered"],
+                "total_markets_fetched": counts.get("total_markets_fetched", counts["scanned"]),
+                "weather_markets_after_filter": counts.get(
+                    "weather_markets_after_filter",
+                    counts.get("weather_candidates", 0),
+                ),
+                "pages_fetched": counts.get("pages_fetched", 1),
+                "candidates_generated": counts.get("candidates_generated", len(candidates)),
             })
+            logger.info(
+                "Day 7 cycle diagnostics: pages_fetched=%d total_markets_fetched=%d "
+                "weather_markets_after_filter=%d candidates_generated=%d",
+                counts.get("pages_fetched", 1),
+                counts.get("total_markets_fetched", counts["scanned"]),
+                counts.get("weather_markets_after_filter", counts.get("weather_candidates", 0)),
+                counts.get("candidates_generated", len(candidates)),
+            )
+            journal.write_event(
+                "micro_cycle_signal_summary",
+                payload={
+                    "cycle_index": _cycle_index,
+                    "pages_fetched": counts.get("pages_fetched", 1),
+                    "total_markets_fetched": counts.get(
+                        "total_markets_fetched",
+                        counts["scanned"],
+                    ),
+                    "weather_markets_after_filter": counts.get(
+                        "weather_markets_after_filter",
+                        counts.get("weather_candidates", 0),
+                    ),
+                    "candidates_generated": counts.get("candidates_generated", len(candidates)),
+                    "signal_scanned": counts["scanned"],
+                    "signal_filtered": counts["filtered"],
+                    "selected": counts.get("selected", len(candidates)),
+                },
+                metadata={"session_id": session_id},
+            )
 
             for rejection in rejections[: args.print_rejections]:
                 journal.write_event(
@@ -404,7 +529,7 @@ def main() -> int:
                     payload=rejection.model_dump(mode="json"),
                 )
 
-            if mode == "dry_run":
+            if effective_dry_run:
                 now = datetime.now(UTC)
                 dry_results, accepted = _run_dry_run_mode(
                     settings=settings,
@@ -427,6 +552,7 @@ def main() -> int:
                 )
                 final_summary = {
                     "mode": "dry_run",
+                    "effective_dry_run": True,
                     "open_positions_count": 0,
                     "realized_pnl_cents": 0,
                     "daily_gross_exposure_cents": 0,
@@ -475,7 +601,11 @@ def main() -> int:
 
         summary_line = (
             f"mode={mode} cycles={total_counts['cycles_processed']} "
+            f"pages_fetched={total_counts['pages_fetched']} "
+            f"total_markets_fetched={total_counts['total_markets_fetched']} "
+            f"weather_markets_after_filter={total_counts['weather_markets_after_filter']} "
             f"signal_scanned={total_counts['signal_scanned']} "
+            f"candidates_generated={total_counts['candidates_generated']} "
             f"candidates_seen={total_counts['candidates_seen']} "
             f"trades_allowed={total_counts['trades_allowed']} "
             f"trades_skipped={total_counts['trades_skipped']} "
@@ -511,8 +641,13 @@ def main() -> int:
             "micro_session_summary",
             payload={
                 "mode": mode,
+                "effective_dry_run": effective_dry_run,
                 "cycles_processed": total_counts["cycles_processed"],
+                "pages_fetched": total_counts["pages_fetched"],
+                "total_markets_fetched": total_counts["total_markets_fetched"],
+                "weather_markets_after_filter": total_counts["weather_markets_after_filter"],
                 "signal_scanned": total_counts["signal_scanned"],
+                "candidates_generated": total_counts["candidates_generated"],
                 "candidates_seen": total_counts["candidates_seen"],
                 "trades_allowed": total_counts["trades_allowed"],
                 "trades_skipped": total_counts["trades_skipped"],

@@ -125,23 +125,138 @@ class KalshiClient:
         return {"ok": True, "sample_market_count": len(markets)}
 
     def fetch_markets_raw(self, limit: int | None = None) -> dict[str, Any] | list[Any]:
-        """Fetch raw markets payload from Kalshi using configured endpoint.
-
-        NOTE: This fetches a single page only. Cursor-based pagination should be
-        added in Day 2 to ensure complete market coverage.
-        """
-        params: dict[str, Any] = {"limit": limit or self.settings.kalshi_default_limit}
+        """Fetch raw markets payload from Kalshi, with optional cursor pagination."""
+        effective_limit = limit or self.settings.kalshi_default_limit
+        params: dict[str, Any] = {"limit": effective_limit}
         # TODO(KALSHI_API): confirm if status/open filter query params are supported.
-        payload = self._request_json("GET", self.settings.kalshi_markets_endpoint, params=params)
-        # Warn if response suggests more data exists beyond this page.
-        if isinstance(payload, dict):
-            cursor = payload.get("cursor") or payload.get("next_cursor") or payload.get("next")
-            if cursor:
-                self.logger.warning(
-                    "API response contains pagination cursor — only first page was fetched. "
-                    "Weather markets beyond this page will be missed."
+        first_payload = self._request_json(
+            "GET",
+            self.settings.kalshi_markets_endpoint,
+            params=params,
+        )
+
+        # Preserve legacy behavior for list payloads (no cursor metadata expected).
+        if not isinstance(first_payload, dict):
+            return first_payload
+
+        records, list_key = self._extract_market_records_with_key(first_payload)
+        if records is None:
+            return first_payload
+
+        pagination_enabled = self._get_bool_setting("kalshi_enable_pagination", True)
+        max_pages = self._get_int_setting("kalshi_max_pages_per_fetch", 10)
+        max_markets = self._get_int_setting("kalshi_max_markets_fetch", 2000)
+        page_sleep_seconds = (
+            self._get_non_negative_int_setting("kalshi_page_sleep_ms", 100) / 1000.0
+        )
+
+        deduped_records: list[Any] = []
+        seen_keys: set[str] = set()
+        seen_cursors: set[str] = set()
+        deduped_count = 0
+
+        def _append_records(page_records: list[Any]) -> None:
+            nonlocal deduped_count
+            for record in page_records:
+                key = self._market_dedupe_key(record)
+                if key is not None:
+                    if key in seen_keys:
+                        deduped_count += 1
+                        continue
+                    seen_keys.add(key)
+                deduped_records.append(record)
+
+        _append_records(records)
+        if len(deduped_records) > max_markets:
+            deduped_records = deduped_records[:max_markets]
+
+        pages_fetched = 1
+        next_cursor = self._extract_pagination_cursor(first_payload)
+        if not pagination_enabled and next_cursor:
+            self.logger.warning(
+                "Kalshi pagination disabled for this run; additional market pages "
+                "were not fetched.",
+                extra={"cursor_present": True},
+            )
+        elif pagination_enabled:
+            while (
+                next_cursor
+                and pages_fetched < max_pages
+                and len(deduped_records) < max_markets
+            ):
+                if next_cursor in seen_cursors:
+                    self.logger.warning(
+                        "Kalshi pagination: repeated cursor detected, stopping. "
+                        "pages_fetched=%d",
+                        pages_fetched,
+                    )
+                    break
+                seen_cursors.add(next_cursor)
+                page_payload = self._request_json(
+                    "GET",
+                    self.settings.kalshi_markets_endpoint,
+                    params={"limit": effective_limit, "cursor": next_cursor},
                 )
-        return payload
+                if not isinstance(page_payload, dict):
+                    raise KalshiAPIError(
+                        "Kalshi paginated markets payload shape invalid: expected object page."
+                    )
+                page_records, _unused_key = self._extract_market_records_with_key(page_payload)
+                if page_records is None:
+                    raise KalshiAPIError(
+                        "Kalshi paginated markets payload missing records list."
+                    )
+                if not page_records:
+                    self.logger.warning(
+                        "Kalshi pagination: empty page received, stopping. "
+                        "pages_fetched=%d",
+                        pages_fetched,
+                    )
+                    pages_fetched += 1
+                    next_cursor = self._extract_pagination_cursor(page_payload)
+                    break
+                _append_records(page_records)
+                if len(deduped_records) >= max_markets:
+                    deduped_records = deduped_records[:max_markets]
+                    pages_fetched += 1
+                    next_cursor = self._extract_pagination_cursor(page_payload)
+                    break
+
+                pages_fetched += 1
+                next_cursor = self._extract_pagination_cursor(page_payload)
+                if next_cursor and page_sleep_seconds > 0:
+                    time.sleep(page_sleep_seconds)
+
+        had_more_pages = bool(next_cursor)
+        summary = {
+            "pagination_enabled": pagination_enabled,
+            "pages_fetched": pages_fetched,
+            "total_markets_fetched": len(deduped_records),
+            "had_more_pages": had_more_pages,
+            "deduped_count": deduped_count,
+            "max_pages_per_fetch": max_pages,
+            "max_markets_fetch": max_markets,
+        }
+        self.logger.info(
+            "Kalshi markets fetch summary: pages_fetched=%d total_markets_fetched=%d "
+            "had_more_pages=%s deduped_count=%d",
+            pages_fetched,
+            len(deduped_records),
+            had_more_pages,
+            deduped_count,
+        )
+
+        result: dict[str, Any] = dict(first_payload)
+        canonical_key = list_key or "markets"
+        result[canonical_key] = deduped_records
+        if canonical_key != "markets":
+            result["markets"] = deduped_records
+        for cursor_key in ("cursor", "next_cursor", "next"):
+            result.pop(cursor_key, None)
+        if had_more_pages and next_cursor:
+            result["cursor"] = next_cursor
+        result["pagination"] = summary
+        return result
 
     def create_order_raw(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         """Submit one order payload to Kalshi.
@@ -212,27 +327,76 @@ class KalshiClient:
         if not isinstance(payload, dict):
             raise KalshiAPIError("Unexpected markets response type; expected dict or list.")
 
-        candidate_keys = ("markets", "data", "results", "items")
-        for key in candidate_keys:
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-
-        # Fallback: first list value found under an unexpected key.
-        # Log a warning so the assumption mismatch is visible without crashing.
-        for key, value in payload.items():
-            if isinstance(value, list):
+        records, key = self._extract_market_records_with_key(payload)
+        if records is not None:
+            if key not in {"markets", "data", "results", "items"}:
                 self.logger.warning(
                     "Market records found under unexpected key %r; "
                     "update candidate_keys to silence this warning.",
                     key,
                 )
-                return value
+            return records
 
         raise KalshiAPIError(
             "Unable to find market records in response payload. "
             "Verify KALSHI_MARKETS_ENDPOINT and response schema."
         )
+
+    @staticmethod
+    def _extract_market_records_with_key(
+        payload: dict[str, Any],
+    ) -> tuple[list[Any] | None, str | None]:
+        candidate_keys = ("markets", "data", "results", "items")
+        for key in candidate_keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value, key
+
+        for key, value in payload.items():
+            if isinstance(value, list):
+                return value, key
+        return None, None
+
+    @staticmethod
+    def _extract_pagination_cursor(payload: dict[str, Any]) -> str | None:
+        for key in ("cursor", "next_cursor", "next"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
+    def _market_dedupe_key(record: Any) -> str | None:
+        if not isinstance(record, dict):
+            return None
+
+        ticker = record.get("ticker")
+        if isinstance(ticker, str) and ticker.strip():
+            return f"ticker:{ticker.strip().upper()}"
+
+        for key in ("id", "market_id"):
+            value = record.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"id:{value.strip()}"
+            if isinstance(value, int):
+                return f"id:{value}"
+        return None
+
+    def _get_bool_setting(self, name: str, default: bool) -> bool:
+        value = getattr(self.settings, name, default)
+        return value if isinstance(value, bool) else default
+
+    def _get_int_setting(self, name: str, default: int) -> int:
+        value = getattr(self.settings, name, default)
+        if isinstance(value, bool):
+            return default
+        return value if isinstance(value, int) and value > 0 else default
+
+    def _get_non_negative_int_setting(self, name: str, default: int) -> int:
+        value = getattr(self.settings, name, default)
+        if isinstance(value, bool):
+            return default
+        return value if isinstance(value, int) and value >= 0 else default
 
     def filter_open_weather_markets(self, markets: list[MarketSummary]) -> list[MarketSummary]:
         """Return markets that appear to be both weather-related and currently open."""

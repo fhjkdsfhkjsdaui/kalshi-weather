@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     kalshi_timeout_seconds: float = Field(default=15.0, alias="KALSHI_TIMEOUT_SECONDS")
     kalshi_default_limit: int = Field(default=200, alias="KALSHI_DEFAULT_LIMIT")
     kalshi_max_print: int = Field(default=10, alias="KALSHI_MAX_PRINT")
+    kalshi_enable_pagination: bool = Field(default=True, alias="KALSHI_ENABLE_PAGINATION")
+    kalshi_max_pages_per_fetch: int = Field(default=10, alias="KALSHI_MAX_PAGES_PER_FETCH")
+    kalshi_max_markets_fetch: int = Field(default=2000, alias="KALSHI_MAX_MARKETS_FETCH")
+    kalshi_page_sleep_ms: int = Field(default=100, alias="KALSHI_PAGE_SLEEP_MS")
 
     journal_dir: Path = Field(default=Path("./data/journal"), alias="JOURNAL_DIR")
     raw_payload_dir: Path = Field(default=Path("./data/raw"), alias="RAW_PAYLOAD_DIR")
@@ -277,6 +281,12 @@ class Settings(BaseSettings):
             raise ValueError("KALSHI_DEFAULT_LIMIT must be > 0.")
         if self.kalshi_max_print <= 0:
             raise ValueError("KALSHI_MAX_PRINT must be > 0.")
+        if self.kalshi_max_pages_per_fetch <= 0:
+            raise ValueError("KALSHI_MAX_PAGES_PER_FETCH must be > 0.")
+        if self.kalshi_max_markets_fetch <= 0:
+            raise ValueError("KALSHI_MAX_MARKETS_FETCH must be > 0.")
+        if self.kalshi_page_sleep_ms < 0:
+            raise ValueError("KALSHI_PAGE_SLEEP_MS must be >= 0.")
         if not self.nws_user_agent.strip():
             raise ValueError("NWS_USER_AGENT must not be empty.")
         if self.weather_timeout_seconds <= 0:
@@ -435,6 +445,10 @@ class Settings(BaseSettings):
             "auth_mode": self.kalshi_auth_mode,
             "timeout_seconds": self.kalshi_timeout_seconds,
             "default_limit": self.kalshi_default_limit,
+            "kalshi_enable_pagination": self.kalshi_enable_pagination,
+            "kalshi_max_pages_per_fetch": self.kalshi_max_pages_per_fetch,
+            "kalshi_max_markets_fetch": self.kalshi_max_markets_fetch,
+            "kalshi_page_sleep_ms": self.kalshi_page_sleep_ms,
             "orders_endpoint": self.kalshi_orders_endpoint,
             "weather_timeout_seconds": self.weather_timeout_seconds,
             "weather_raw_journaling": self.weather_journal_raw_payloads,

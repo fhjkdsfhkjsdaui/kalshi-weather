@@ -176,25 +176,91 @@ def _resolve_market_records(
     logger: Any,
     journal: JournalWriter,
 ) -> list[dict[str, Any]]:
+    records, _diagnostics = _resolve_market_records_with_diagnostics(
+        args=args,
+        settings=settings,
+        logger=logger,
+        journal=journal,
+    )
+    return records
+
+
+def _resolve_market_records_with_diagnostics(
+    *,
+    args: argparse.Namespace,
+    settings: Settings,
+    logger: Any,
+    journal: JournalWriter,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if args.input_markets_file:
         payload = _load_json_file(args.input_markets_file)
         records = _extract_market_records(payload)
+        diagnostics = _extract_market_fetch_diagnostics(payload, record_count=len(records))
         journal.write_event(
             "signal_markets_input_loaded",
-            payload={"source": "file", "path": str(args.input_markets_file), "count": len(records)},
+            payload={
+                "source": "file",
+                "path": str(args.input_markets_file),
+                "count": len(records),
+                **diagnostics,
+            },
         )
-        return records
+        return records, diagnostics
 
     limit = args.max_markets_to_scan or settings.signal_max_markets_to_scan
     with KalshiClient(settings=settings, logger=logger) as client:
         client.validate_connection()
         payload = client.fetch_markets_raw(limit=limit)
+    records = _extract_market_records(payload)
+    diagnostics = _extract_market_fetch_diagnostics(payload, record_count=len(records))
     raw_path = journal.write_raw_snapshot("day5_markets", payload)
     journal.write_event(
         "signal_markets_input_loaded",
-        payload={"source": "api", "limit": limit, "raw_snapshot_path": str(raw_path)},
+        payload={
+            "source": "api",
+            "limit": limit,
+            "raw_snapshot_path": str(raw_path),
+            **diagnostics,
+        },
     )
-    return _extract_market_records(payload)
+    return records, diagnostics
+
+
+def _extract_market_fetch_diagnostics(
+    payload: Any,
+    *,
+    record_count: int,
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "pages_fetched": 1,
+        "total_markets_fetched": record_count,
+        "had_more_pages": False,
+        "deduped_count": 0,
+    }
+    if not isinstance(payload, dict):
+        return diagnostics
+
+    cursor_present = bool(
+        payload.get("cursor") or payload.get("next_cursor") or payload.get("next")
+    )
+    pagination = payload.get("pagination")
+    if isinstance(pagination, dict):
+        pages_fetched = pagination.get("pages_fetched")
+        if isinstance(pages_fetched, int) and pages_fetched > 0:
+            diagnostics["pages_fetched"] = pages_fetched
+        total_markets = pagination.get("total_markets_fetched")
+        if isinstance(total_markets, int) and total_markets >= 0:
+            diagnostics["total_markets_fetched"] = total_markets
+        had_more_pages = pagination.get("had_more_pages")
+        if isinstance(had_more_pages, bool):
+            diagnostics["had_more_pages"] = had_more_pages
+        deduped_count = pagination.get("deduped_count")
+        if isinstance(deduped_count, int) and deduped_count >= 0:
+            diagnostics["deduped_count"] = deduped_count
+        return diagnostics
+
+    diagnostics["had_more_pages"] = cursor_present
+    return diagnostics
 
 
 def _market_spread_cents(market: dict[str, Any]) -> int | None:
