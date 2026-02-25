@@ -105,6 +105,7 @@ class KalshiCreateOrderRequest(BaseModel):
 
     market_id: str
     side: Literal["yes", "no"]
+    action: Literal["buy", "sell"] = "buy"
     price_cents: int = Field(ge=1, le=99)
     quantity: int = Field(gt=0)
     client_order_id: str | None = None
@@ -116,11 +117,15 @@ class KalshiCreateOrderRequest(BaseModel):
         """
         payload: dict[str, Any] = {
             "ticker": self.market_id,
+            "action": self.action,
             "side": self.side,
-            "price": self.price_cents,
             "count": self.quantity,
             "type": "limit",
         }
+        if self.side == "yes":
+            payload["yes_price"] = self.price_cents
+        else:
+            payload["no_price"] = self.price_cents
         if self.client_order_id:
             payload["client_order_id"] = self.client_order_id
         return payload

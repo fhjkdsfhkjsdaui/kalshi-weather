@@ -176,6 +176,35 @@ def _first_market_string(raw_market: dict[str, Any], keys: tuple[str, ...]) -> s
     return None
 
 
+def _market_search_text(raw_market: dict[str, Any]) -> str:
+    """Build parser search text from known title/subtitle/rules fields."""
+    title = _first_market_string(raw_market, ("title", "market_title", "name"))
+    subtitle = _first_market_string(raw_market, ("subtitle", "market_subtitle", "event_subtitle"))
+    rules_primary = _first_market_string(raw_market, ("rules_primary", "rules", "rulesPrimary"))
+    rules_secondary = _first_market_string(raw_market, ("rules_secondary", "rulesSecondary"))
+    return " ".join(part for part in (title, subtitle, rules_primary, rules_secondary) if part)
+
+
+def _normalized_weather_age_seconds(
+    *,
+    now: datetime,
+    retrieval_timestamp: datetime,
+    logger: Any,
+) -> float:
+    """Compute weather snapshot age with a defensive clamp for small clock skew."""
+    age_seconds = (now - retrieval_timestamp).total_seconds()
+    if age_seconds < 0:
+        logger.warning(
+            "Weather snapshot retrieval timestamp is in the future; clamping age to 0. "
+            "age_seconds=%.3f retrieval_timestamp=%s now=%s",
+            age_seconds,
+            retrieval_timestamp.isoformat(),
+            now.isoformat(),
+        )
+        return 0.0
+    return age_seconds
+
+
 def _weather_filter_rejection_reasons(
     *,
     raw_market: dict[str, Any],
@@ -254,11 +283,18 @@ def _evaluate_signal_candidates(
 ) -> tuple[list[MicroTradeCandidate], list[SignalRejection], dict[str, int]]:
     now = datetime.now(UTC)
     scan_limit = args.max_markets_to_scan or settings.signal_max_markets_to_scan
+    parser = KalshiWeatherContractParser(logger=logger)
+
+    def _weather_prefilter(record: dict[str, Any]) -> bool:
+        return parser._is_weather_candidate(_market_search_text(record), record)
+
     market_records, market_fetch = _resolve_market_records_with_diagnostics(
         args=args,
         settings=settings,
         logger=logger,
         journal=journal,
+        weather_candidate_target=scan_limit,
+        weather_candidate_predicate=_weather_prefilter,
     )
     weather_snapshot = _resolve_weather_snapshot(
         args=args,
@@ -267,8 +303,12 @@ def _evaluate_signal_candidates(
         journal=journal,
     )
     weather_ref = weather_snapshot.raw_payload_path or weather_snapshot.source_url
+    weather_age_seconds = _normalized_weather_age_seconds(
+        now=now,
+        retrieval_timestamp=weather_snapshot.retrieval_timestamp,
+        logger=logger,
+    )
 
-    parser = KalshiWeatherContractParser(logger=logger)
     matcher = WeatherMarketMatcher(logger=logger)
     estimator = WeatherProbabilityEstimator(logger=logger)
     edge_calculator = EdgeCalculator(settings=settings, logger=logger)
@@ -279,14 +319,16 @@ def _evaluate_signal_candidates(
     weather_rejection_reasons: Counter[str] = Counter()
     parse_status_counts: Counter[str] = Counter()
     near_miss_samples: list[dict[str, Any]] = []
+    weather_candidates_scanned = 0
 
-    for raw_market in market_records[:scan_limit]:
+    for raw_market in market_records:
         parsed = parser.parse_market(raw_market)
         market_id = parsed.provider_market_id
+        if parsed.weather_candidate:
+            weather_candidates_scanned += 1
         match_result = matcher.match_contract(parsed, weather_snapshot)
         estimate_result = estimator.estimate(parsed, match_result)
         edge_result = edge_calculator.compute(raw_market, estimate_result)
-        weather_age_seconds = (now - weather_snapshot.retrieval_timestamp).total_seconds()
         evaluation = SignalEvaluation(
             market_id=market_id,
             ticker=parsed.ticker,
@@ -317,6 +359,8 @@ def _evaluate_signal_candidates(
                         rejection_reasons=rejection_reasons,
                     )
                 )
+        if weather_candidates_scanned >= scan_limit:
+            break
 
     selection = selector.select(
         evaluations,
@@ -375,6 +419,10 @@ def _evaluate_signal_candidates(
         "candidates_generated": len(candidates),
         "had_more_pages": int(bool(market_fetch.get("had_more_pages", False))),
         "deduped_count": int(market_fetch.get("deduped_count", 0)),
+        "prefilter_weather_matches_found": int(market_fetch.get("candidate_matches_found", 0)),
+        "prefilter_stopped_on_target": int(
+            bool(market_fetch.get("stopped_on_candidate_target", False))
+        ),
     }
     weather_candidates = counts["weather_candidates"]
     excluded_count = max(0, len(evaluations) - weather_candidates)
@@ -802,11 +850,14 @@ def main() -> int:
                 )
             logger.info(
                 "Day 7 cycle diagnostics: pages_fetched=%d total_markets_fetched=%d "
-                "weather_markets_after_filter=%d candidates_generated=%d",
+                "weather_markets_after_filter=%d candidates_generated=%d "
+                "prefilter_weather_matches_found=%d prefilter_stopped_on_target=%s",
                 counts.get("pages_fetched", 1),
                 counts.get("total_markets_fetched", counts["scanned"]),
                 counts.get("weather_markets_after_filter", counts.get("weather_candidates", 0)),
                 counts.get("candidates_generated", len(candidates)),
+                counts.get("prefilter_weather_matches_found", 0),
+                bool(counts.get("prefilter_stopped_on_target", 0)),
             )
             journal.write_event(
                 "micro_cycle_signal_summary",
@@ -824,6 +875,13 @@ def main() -> int:
                     "candidates_generated": counts.get("candidates_generated", len(candidates)),
                     "had_more_pages": bool(counts.get("had_more_pages", 0)),
                     "deduped_count": counts.get("deduped_count", 0),
+                    "prefilter_weather_matches_found": counts.get(
+                        "prefilter_weather_matches_found",
+                        0,
+                    ),
+                    "prefilter_stopped_on_target": bool(
+                        counts.get("prefilter_stopped_on_target", 0)
+                    ),
                     "signal_scanned": counts["scanned"],
                     "signal_filtered": counts["filtered"],
                     "selected": counts.get("selected", len(candidates)),

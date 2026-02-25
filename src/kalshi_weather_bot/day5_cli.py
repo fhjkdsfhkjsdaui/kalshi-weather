@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -191,6 +192,8 @@ def _resolve_market_records_with_diagnostics(
     settings: Settings,
     logger: Any,
     journal: JournalWriter,
+    weather_candidate_target: int | None = None,
+    weather_candidate_predicate: Callable[[dict[str, Any]], bool] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if args.input_markets_file:
         payload = _load_json_file(args.input_markets_file)
@@ -210,7 +213,11 @@ def _resolve_market_records_with_diagnostics(
     limit = args.max_markets_to_scan or settings.signal_max_markets_to_scan
     with KalshiClient(settings=settings, logger=logger) as client:
         client.validate_connection()
-        payload = client.fetch_markets_raw(limit=limit)
+        payload = client.fetch_markets_raw(
+            limit=limit,
+            candidate_target=weather_candidate_target,
+            candidate_predicate=weather_candidate_predicate,
+        )
     records = _extract_market_records(payload)
     diagnostics = _extract_market_fetch_diagnostics(payload, record_count=len(records))
     raw_path = journal.write_raw_snapshot("day5_markets", payload)

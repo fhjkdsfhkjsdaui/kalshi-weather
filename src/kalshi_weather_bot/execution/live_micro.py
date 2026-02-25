@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from collections import Counter
@@ -301,6 +302,8 @@ class LiveMicroRunner:
                 "price_cents": candidate.price_cents,
                 "quantity": candidate.quantity,
                 "status": submit_status.normalized_status,
+                "status_raw": submit_status.status_raw,
+                "status_raw_keys": sorted(submit_status.raw.keys())[:20],
             },
         )
         self.position_tracker.record_trade_submission(timestamp=self._now())
@@ -315,31 +318,48 @@ class LiveMicroRunner:
                 attempt_id=attempt_id,
             )
             if polled_status is None:
-                tracker.transition("timeout", note="reconciliation_unresolved")
-                self._write_event(
-                    "micro_order_unresolved",
-                    payload={
-                        "attempt_id": attempt_id,
-                        "order_id": submit_status.order_id,
-                        "reason": "remote_terminal_state_unconfirmed",
-                    },
-                )
-                halted = self.settings.micro_halt_on_reconciliation_mismatch
-                return MicroOrderAttempt(
-                    candidate=candidate,
-                    policy_decision=decision,
-                    attempted=True,
-                    outcome="unresolved",
+                (
+                    cancel_status,
+                    cancel_polled_count,
+                    cancel_reason,
+                ) = self._attempt_cancel_after_timeout(
                     order_id=submit_status.order_id,
-                    terminal_status="unresolved",
-                    filled_quantity=record.filled_quantity,
-                    reasons=["reconciliation_unresolved"],
-                    polled_count=polled_count,
-                    unresolved=True,
-                    reconciliation_mismatch=True,
-                    halted=halted,
+                    attempt_id=attempt_id,
+                    tracker=tracker,
+                    record=record,
+                    poll_timeout_seconds=poll_timeout_seconds,
+                    poll_interval_seconds=poll_interval_seconds,
                 )
-            terminal_status = polled_status
+                polled_count += cancel_polled_count
+                if cancel_status is None:
+                    tracker.transition("timeout", note="reconciliation_unresolved")
+                    unresolved_reason = cancel_reason or "remote_terminal_state_unconfirmed"
+                    self._write_event(
+                        "micro_order_unresolved",
+                        payload={
+                            "attempt_id": attempt_id,
+                            "order_id": submit_status.order_id,
+                            "reason": unresolved_reason,
+                        },
+                    )
+                    halted = self.settings.micro_halt_on_reconciliation_mismatch
+                    return MicroOrderAttempt(
+                        candidate=candidate,
+                        policy_decision=decision,
+                        attempted=True,
+                        outcome="unresolved",
+                        order_id=submit_status.order_id,
+                        terminal_status="unresolved",
+                        filled_quantity=record.filled_quantity,
+                        reasons=["reconciliation_unresolved"],
+                        polled_count=polled_count,
+                        unresolved=True,
+                        reconciliation_mismatch=True,
+                        halted=halted,
+                    )
+                terminal_status = cancel_status
+            else:
+                terminal_status = polled_status
 
         self._apply_remote_snapshot(record=record, status=terminal_status)
         outcome, reasons, mismatch = self._apply_terminal_status(
@@ -413,7 +433,10 @@ class LiveMicroRunner:
         last_status: KalshiOrderStatus | None = None
         while self._now().timestamp() <= deadline:
             try:
-                status = self.adapter.get_order(order_id)
+                status = self._get_order_with_attempt_context(
+                    order_id=order_id,
+                    attempt_id=attempt_id,
+                )
             except OrderAdapterError as exc:
                 self._write_event(
                     "order_status_polled",
@@ -436,7 +459,13 @@ class LiveMicroRunner:
                     "attempt_id": attempt_id,
                     "order_id": status.order_id,
                     "normalized_status": status.normalized_status,
+                    "status_raw": status.status_raw,
                     "filled_quantity": status.filled_quantity,
+                    "status_raw_keys": (
+                        sorted(status.raw.keys())[:20]
+                        if status.normalized_status == "unknown"
+                        else []
+                    ),
                 },
             )
             if status.is_terminal:
@@ -444,6 +473,155 @@ class LiveMicroRunner:
             self._sleep(poll_interval_seconds)
 
         return (last_status if last_status and last_status.is_terminal else None), polled_count
+
+    def _attempt_cancel_after_timeout(
+        self,
+        *,
+        order_id: str,
+        attempt_id: str,
+        tracker: OrderLifecycleTracker,
+        record: LocalOrderRecord,
+        poll_timeout_seconds: float,
+        poll_interval_seconds: float,
+    ) -> tuple[KalshiOrderStatus | None, int, str | None]:
+        cancel_fn = getattr(self.adapter, "cancel_order", None)
+        if not callable(cancel_fn):
+            return None, 0, "cancel_method_unavailable"
+
+        tracker.transition("cancel_requested", note="poll_timeout_cancel")
+        self._write_event(
+            "micro_order_cancel_requested",
+            payload={
+                "attempt_id": attempt_id,
+                "order_id": order_id,
+                "reason": "poll_timeout",
+            },
+        )
+        try:
+            cancel_status = self._cancel_order_with_attempt_context(
+                order_id=order_id,
+                attempt_id=attempt_id,
+            )
+        except OrderAdapterError as exc:
+            record.error_category = exc.category
+            record.error_message = sanitize_text(str(exc))
+            self._write_event(
+                "micro_order_cancel_error",
+                payload={
+                    "attempt_id": attempt_id,
+                    "order_id": order_id,
+                    "error_category": exc.category,
+                    "status_code": exc.status_code,
+                    "error": sanitize_text(str(exc)),
+                },
+            )
+            final = self._final_reconciliation_read(
+                order_id=order_id,
+                attempt_id=attempt_id,
+            )
+            if final is not None:
+                return final, 0, None
+            return None, 0, "cancel_after_timeout_failed"
+
+        self._apply_remote_snapshot(record=record, status=cancel_status)
+        tracker.transition("cancel_ack", raw_status=cancel_status.status_raw)
+        self._write_event(
+            "micro_order_cancel_ack",
+            payload={
+                "attempt_id": attempt_id,
+                "order_id": cancel_status.order_id,
+                "normalized_status": cancel_status.normalized_status,
+                "filled_quantity": cancel_status.filled_quantity,
+            },
+        )
+        if cancel_status.is_terminal:
+            return cancel_status, 0, None
+
+        polled_status, polled_count = self._poll_terminal_status(
+            order_id=order_id,
+            poll_timeout_seconds=poll_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            attempt_id=attempt_id,
+        )
+        if polled_status is None:
+            final = self._final_reconciliation_read(
+                order_id=order_id,
+                attempt_id=attempt_id,
+            )
+            if final is not None:
+                return final, polled_count, None
+            return None, polled_count, "remote_terminal_state_unconfirmed_after_cancel"
+        return polled_status, polled_count, None
+
+    def _get_order_with_attempt_context(
+        self,
+        *,
+        order_id: str,
+        attempt_id: str,
+    ) -> KalshiOrderStatus:
+        get_fn = self.adapter.get_order
+        if self._supports_client_order_id(get_fn):
+            return get_fn(order_id, client_order_id=attempt_id)
+        return get_fn(order_id)
+
+    def _cancel_order_with_attempt_context(
+        self,
+        *,
+        order_id: str,
+        attempt_id: str,
+    ) -> KalshiOrderStatus:
+        cancel_fn = self.adapter.cancel_order
+        if self._supports_client_order_id(cancel_fn):
+            return cancel_fn(order_id, client_order_id=attempt_id)
+        return cancel_fn(order_id)
+
+    def _final_reconciliation_read(
+        self,
+        *,
+        order_id: str,
+        attempt_id: str,
+    ) -> KalshiOrderStatus | None:
+        """One last status read (direct + list fallback) before declaring unresolved.
+
+        Returns a KalshiOrderStatus only when the remote state is terminal.
+        Returns None when the read fails or the order is still non-terminal.
+        """
+        self._write_event(
+            "micro_order_final_reconciliation_read",
+            payload={
+                "attempt_id": attempt_id,
+                "order_id": order_id,
+            },
+        )
+        try:
+            status = self._get_order_with_attempt_context(
+                order_id=order_id,
+                attempt_id=attempt_id,
+            )
+        except OrderAdapterError:
+            return None
+        self._write_event(
+            "order_status_polled",
+            payload={
+                "attempt_id": attempt_id,
+                "order_id": status.order_id,
+                "normalized_status": status.normalized_status,
+                "status_raw": status.status_raw,
+                "filled_quantity": status.filled_quantity,
+                "source": "final_reconciliation_read",
+            },
+        )
+        if status.is_terminal:
+            return status
+        return None
+
+    @staticmethod
+    def _supports_client_order_id(callable_obj: object) -> bool:
+        try:
+            signature = inspect.signature(callable_obj)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+        return "client_order_id" in signature.parameters
 
     def _apply_terminal_status(
         self,
@@ -500,6 +678,19 @@ class LiveMicroRunner:
             return "rejected", reasons, mismatch
 
         if status.normalized_status == "canceled":
+            if tracker.record.current_state in {"cancel_requested", "cancel_ack"}:
+                tracker.transition("canceled", raw_status=status.status_raw)
+                self._write_event(
+                    "micro_order_canceled",
+                    payload={
+                        "attempt_id": attempt_id,
+                        "order_id": status.order_id,
+                        "market_id": candidate.market_id,
+                        "reason": "timeout_cancelled",
+                    },
+                )
+                return "canceled", reasons, mismatch
+
             tracker.transition("terminal_error", note="remote_canceled_without_local_cancel")
             self._write_event(
                 "micro_order_unresolved",

@@ -64,11 +64,39 @@ class KalshiLiveOrderAdapter:
         fallback_id = client_order_id if client_order_id else None
         return self._normalize_order(raw, fallback_order_id=fallback_id)
 
-    def cancel_order(self, order_id: str) -> KalshiOrderStatus:
+    def cancel_order(
+        self,
+        order_id: str,
+        *,
+        client_order_id: str | None = None,
+    ) -> KalshiOrderStatus:
         """Send cancel request for one order id and normalize response."""
         try:
             raw = self.client.cancel_order_raw(order_id)
         except KalshiRequestError as exc:
+            fallback_ids: list[str] = []
+            if client_order_id and client_order_id != order_id:
+                fallback_ids.append(client_order_id)
+            list_lookup = self._get_order_via_list_lookup(
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
+            if list_lookup and list_lookup.order_id != order_id:
+                fallback_ids.append(list_lookup.order_id)
+
+            if exc.status_code == 404:
+                for fallback_id in fallback_ids:
+                    try:
+                        raw = self.client.cancel_order_raw(fallback_id)
+                    except KalshiRequestError:
+                        continue
+                    except KalshiAPIError as inner_exc:
+                        raise OrderAdapterError(
+                            str(inner_exc),
+                            category="unknown",
+                            status_code=None,
+                        ) from inner_exc
+                    return self._normalize_order(raw, fallback_order_id=fallback_id)
             raise OrderAdapterError(
                 str(exc),
                 category=self._safe_category(exc.category),
@@ -78,11 +106,23 @@ class KalshiLiveOrderAdapter:
             raise OrderAdapterError(str(exc), category="unknown", status_code=None) from exc
         return self._normalize_order(raw, fallback_order_id=order_id)
 
-    def get_order(self, order_id: str) -> KalshiOrderStatus:
+    def get_order(
+        self,
+        order_id: str,
+        *,
+        client_order_id: str | None = None,
+    ) -> KalshiOrderStatus:
         """Fetch and normalize one order status by id."""
         try:
             raw = self.client.get_order_raw(order_id)
         except KalshiRequestError as exc:
+            if exc.status_code == 404:
+                fallback = self._get_order_via_list_lookup(
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                )
+                if fallback is not None:
+                    return fallback
             raise OrderAdapterError(
                 str(exc),
                 category=self._safe_category(exc.category),
@@ -90,7 +130,45 @@ class KalshiLiveOrderAdapter:
             ) from exc
         except KalshiAPIError as exc:
             raise OrderAdapterError(str(exc), category="unknown", status_code=None) from exc
-        return self._normalize_order(raw, fallback_order_id=order_id)
+        normalized = self._normalize_order(raw, fallback_order_id=order_id)
+        if normalized.normalized_status == "unknown":
+            fallback = self._get_order_via_list_lookup(
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
+            if fallback is not None and fallback.normalized_status != "unknown":
+                return fallback
+        return normalized
+
+    def _get_order_via_list_lookup(
+        self,
+        order_id: str,
+        client_order_id: str | None = None,
+    ) -> KalshiOrderStatus | None:
+        """Fallback lookup when direct order-by-id endpoint returns not_found.
+
+        Some API deployments may lag order visibility on the direct endpoint while
+        the order is already present in the list endpoint.
+        """
+        try:
+            raw = self.client.list_orders_raw(limit=200)
+        except (KalshiRequestError, KalshiAPIError):
+            return None
+
+        records = _extract_order_records(raw)
+        target_ids: set[str] = {order_id}
+        if client_order_id:
+            target_ids.add(client_order_id)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            order_payload = _unwrap_order_payload(record)
+            if _source_contains_id(
+                sources=(order_payload, record),
+                target_ids=target_ids,
+            ):
+                return self._normalize_order(record, fallback_order_id=order_id)
+        return None
 
     def _normalize_order(
         self,
@@ -99,7 +177,14 @@ class KalshiLiveOrderAdapter:
         fallback_order_id: str | None,
     ) -> KalshiOrderStatus:
         payload = _unwrap_order_payload(raw_response)
-        order_id = _first_string(payload, ("order_id", "id", "client_order_id"))
+        sources: tuple[dict[str, Any], ...] = (
+            (payload,) if payload is raw_response else (payload, raw_response)
+        )
+
+        order_id = _first_string_from_sources(
+            sources,
+            ("order_id", "id", "client_order_id"),
+        )
         if order_id is None:
             order_id = fallback_order_id
         if not order_id:
@@ -109,22 +194,40 @@ class KalshiLiveOrderAdapter:
                 status_code=None,
             )
 
-        status_raw = _first_string(payload, ("status", "order_status", "state"))
-        requested_qty = _first_int(
-            payload,
-            ("count", "quantity", "size", "requested_quantity", "requested_count"),
+        status_raw = _first_string_from_sources(sources, ("status", "order_status", "state"))
+        requested_qty = _first_int_from_sources(
+            sources,
+            (
+                "count",
+                "quantity",
+                "size",
+                "requested_quantity",
+                "requested_count",
+                "initial_count",
+                "initial_size",
+                "initial_count_fp",
+            ),
         )
-        filled_qty = _first_int(
-            payload,
-            ("filled_quantity", "filled_count", "filled_size", "matched_count"),
+        filled_qty = _first_int_from_sources(
+            sources,
+            (
+                "filled_quantity",
+                "filled_count",
+                "filled_size",
+                "matched_count",
+                "fill_count",
+                "fill_size",
+                "fill_count_fp",
+            ),
         )
-        remaining_qty = _first_int(
-            payload,
+        remaining_qty = _first_int_from_sources(
+            sources,
             (
                 "remaining_quantity",
                 "remaining_count",
                 "remaining_size",
                 "unfilled_count",
+                "remaining_count_fp",
             ),
         )
         if filled_qty is None:
@@ -143,8 +246,8 @@ class KalshiLiveOrderAdapter:
             requested_quantity=requested_qty,
             filled_quantity=filled_qty,
             remaining_quantity=remaining_qty,
-            updated_at=_first_datetime(
-                payload,
+            updated_at=_first_datetime_from_sources(
+                sources,
                 ("updated_time", "updated_at", "last_updated_time", "created_time"),
             ),
             raw=payload,
@@ -165,6 +268,18 @@ def _unwrap_order_payload(raw: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
+def _extract_order_records(payload: dict[str, Any] | list[Any]) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("orders", "data", "results", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
 def _first_string(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     for key in keys:
         value = payload.get(key)
@@ -173,12 +288,47 @@ def _first_string(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     return None
 
 
+def _first_string_from_sources(
+    sources: tuple[dict[str, Any], ...],
+    keys: tuple[str, ...],
+) -> str | None:
+    for source in sources:
+        value = _first_string(source, keys)
+        if value is not None:
+            return value
+    return None
+
+
+def _source_contains_id(
+    *,
+    sources: tuple[dict[str, Any], ...],
+    target_ids: set[str],
+) -> bool:
+    for source in sources:
+        for key in ("order_id", "id", "client_order_id"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip() in target_ids:
+                return True
+    return False
+
+
 def _first_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int | None:
     for key in keys:
         value = payload.get(key)
         parsed = _to_int(value)
         if parsed is not None:
             return parsed
+    return None
+
+
+def _first_int_from_sources(
+    sources: tuple[dict[str, Any], ...],
+    keys: tuple[str, ...],
+) -> int | None:
+    for source in sources:
+        value = _first_int(source, keys)
+        if value is not None:
+            return value
     return None
 
 
@@ -204,6 +354,17 @@ def _first_datetime(payload: dict[str, Any], keys: tuple[str, ...]) -> datetime 
         parsed = _parse_datetime(value)
         if parsed is not None:
             return parsed
+    return None
+
+
+def _first_datetime_from_sources(
+    sources: tuple[dict[str, Any], ...],
+    keys: tuple[str, ...],
+) -> datetime | None:
+    for source in sources:
+        value = _first_datetime(source, keys)
+        if value is not None:
+            return value
     return None
 
 
@@ -239,6 +400,28 @@ def _normalize_status(
     remaining_quantity: int | None,
 ) -> NormalizedOrderStatus:
     status = (status_raw or "").strip().lower()
+
+    if "executed" in status:
+        if requested_quantity is not None and requested_quantity > 0:
+            if filled_quantity >= requested_quantity:
+                return "filled"
+            if filled_quantity > 0:
+                return "partially_filled"
+            if remaining_quantity is not None:
+                if remaining_quantity <= 0:
+                    return "filled"
+                return "open"
+            return "open"
+        if remaining_quantity is not None:
+            if remaining_quantity <= 0 and filled_quantity > 0:
+                return "filled"
+            if filled_quantity > 0:
+                return "partially_filled"
+            return "open"
+        if filled_quantity > 0:
+            return "partially_filled"
+        return "open"
+
     if any(token in status for token in ("cancel", "canceled", "cancelled")):
         return "canceled"
     if any(token in status for token in ("reject", "rejected", "invalid")):

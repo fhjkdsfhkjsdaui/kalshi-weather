@@ -20,6 +20,7 @@ from kalshi_weather_bot.execution.live_models import (
     CancelOnlyBatchResult,
     CancelOnlyBatchSummary,
     CancelOnlyOrderIntent,
+    KalshiCreateOrderRequest,
     KalshiOrderStatus,
     LocalOrderRecord,
 )
@@ -955,6 +956,40 @@ class TestModelValidation:
         high = CancelOnlyOrderIntent(market_id="KX", side="yes", price_cents=99, quantity=1)
         assert low.price_cents == 1
         assert high.price_cents == 99
+
+    def test_create_order_payload_yes_side_uses_yes_price(self) -> None:
+        request = KalshiCreateOrderRequest(
+            market_id="KXHIGHNY-26FEB25-T39",
+            side="yes",
+            price_cents=8,
+            quantity=1,
+            client_order_id="test-order-1",
+        )
+        payload = request.to_payload()
+        assert payload["action"] == "buy"
+        assert payload["ticker"] == "KXHIGHNY-26FEB25-T39"
+        assert payload["side"] == "yes"
+        assert payload["yes_price"] == 8
+        assert "no_price" not in payload
+        assert payload["count"] == 1
+        assert payload["type"] == "limit"
+
+    def test_create_order_payload_no_side_uses_no_price(self) -> None:
+        request = KalshiCreateOrderRequest(
+            market_id="KXHIGHNY-26FEB25-T39",
+            side="no",
+            price_cents=12,
+            quantity=1,
+            client_order_id="test-order-2",
+        )
+        payload = request.to_payload()
+        assert payload["action"] == "buy"
+        assert payload["ticker"] == "KXHIGHNY-26FEB25-T39"
+        assert payload["side"] == "no"
+        assert payload["no_price"] == 12
+        assert "yes_price" not in payload
+        assert payload["count"] == 1
+        assert payload["type"] == "limit"
 
 
 # ── No secret leakage in journal payloads ──

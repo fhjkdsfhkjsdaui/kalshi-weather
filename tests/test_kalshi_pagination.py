@@ -617,3 +617,91 @@ def test_page_retry_validation_error_does_not_retry(monkeypatch: Any) -> None:
         client.close()
 
     assert calls == 2
+
+
+def test_fetch_markets_stops_when_weather_candidate_target_met(monkeypatch: Any) -> None:
+    client = _client(
+        kalshi_max_pages_per_fetch=10,
+        kalshi_max_markets_fetch=2000,
+    )
+    responses: list[dict[str, Any]] = [
+        {
+            "markets": [
+                {"event_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-1", "ticker": "SPORT-1"},
+                {"event_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-2", "ticker": "SPORT-2"},
+            ],
+            "cursor": "c2",
+        },
+        {
+            "markets": [
+                {"event_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-3", "ticker": "SPORT-3"},
+                {"event_ticker": "KXHIGHTEMP-NYC", "ticker": "KXHIGHTEMP-NYC-90"},
+            ],
+            "cursor": "c3",
+        },
+        {"markets": [{"event_ticker": "KXHIGHTEMP-SEA", "ticker": "KXHIGHTEMP-SEA-85"}]},
+    ]
+    calls = 0
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del method, endpoint, params, json_body
+        response = responses[calls]
+        calls += 1
+        return response
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        payload = client.fetch_markets_raw(
+            limit=100,
+            candidate_target=1,
+            candidate_predicate=lambda record: str(record.get("event_ticker", "")).startswith(
+                "KXHIGHTEMP"
+            ),
+        )
+    finally:
+        client.close()
+
+    assert isinstance(payload, dict)
+    assert calls == 2
+    assert payload["pagination"]["pages_fetched"] == 2
+    assert payload["pagination"]["candidate_matches_found"] == 1
+    assert payload["pagination"]["candidate_target"] == 1
+    assert payload["pagination"]["candidate_target_met"] is True
+    assert payload["pagination"]["stopped_on_candidate_target"] is True
+
+
+def test_fetch_markets_candidate_target_ignored_without_predicate(monkeypatch: Any) -> None:
+    client = _client()
+    calls = 0
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del method, endpoint, params, json_body
+        calls += 1
+        if calls == 1:
+            return {"markets": [{"ticker": "A"}], "cursor": "c2"}
+        return {"markets": [{"ticker": "B"}]}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        payload = client.fetch_markets_raw(limit=50, candidate_target=1, candidate_predicate=None)
+    finally:
+        client.close()
+
+    assert isinstance(payload, dict)
+    assert calls == 2
+    assert payload["pagination"]["candidate_target"] is None
+    assert payload["pagination"]["candidate_matches_found"] == 0
+    assert payload["pagination"]["candidate_target_met"] is False
+    assert payload["pagination"]["stopped_on_candidate_target"] is False

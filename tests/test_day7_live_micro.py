@@ -115,9 +115,11 @@ class _FakeAdapter:
         self,
         *,
         submit_seq: list[KalshiOrderStatus | Exception],
+        cancel_seq: list[KalshiOrderStatus | Exception] | None = None,
         get_seq: list[KalshiOrderStatus | Exception] | None = None,
     ) -> None:
         self.submit_seq = list(submit_seq)
+        self.cancel_seq = list(cancel_seq or [])
         self.get_seq = list(get_seq or [])
 
     def submit_order(
@@ -136,6 +138,14 @@ class _FakeAdapter:
         if not self.get_seq:
             return _status(order_id=order_id, normalized="open", raw="open")
         item = self.get_seq.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def cancel_order(self, order_id: str) -> KalshiOrderStatus:
+        if not self.cancel_seq:
+            return _status(order_id=order_id, normalized="open", raw="open")
+        item = self.cancel_seq.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
@@ -642,6 +652,35 @@ def test_poll_timeout_returns_unresolved_and_halts() -> None:
     assert result.attempts[0].outcome == "unresolved"
     assert result.attempts[0].unresolved is True
     assert result.summary.halted_early is True
+
+
+def test_poll_timeout_then_cancel_resolves_to_canceled() -> None:
+    clock = _StepClock(step_seconds=5.0)
+    adapter = _FakeAdapter(
+        submit_seq=[_status(order_id="o-timeout-cancel", normalized="open")],
+        cancel_seq=[_status(order_id="o-timeout-cancel", normalized="canceled", raw="canceled")],
+        get_seq=[
+            _status(order_id="o-timeout-cancel", normalized="open"),
+            _status(order_id="o-timeout-cancel", normalized="open"),
+        ],
+    )
+    runner = LiveMicroRunner(
+        settings=_settings(micro_require_supervised_mode=False),
+        adapter=adapter,  # type: ignore[arg-type]
+        logger=logging.getLogger("test"),
+        now_provider=clock,
+        sleep_fn=lambda _: None,
+    )
+    result = runner.run_candidates(
+        candidates=[_candidate()],
+        supervised=True,
+        poll_timeout_seconds=2.0,
+        poll_interval_seconds=0.1,
+    )
+    assert result.attempts[0].outcome == "canceled"
+    assert result.attempts[0].unresolved is False
+    assert result.summary.cancels == 1
+    assert result.summary.halted_early is False
 
 
 # --- Position tracker opposite-side pairing ---
@@ -1634,3 +1673,203 @@ def test_weather_filter_returns_empty_for_valid_weather_contract() -> None:
         parsed=parsed,
     )
     assert reasons == []
+
+
+def test_normalized_weather_age_seconds_clamps_future_timestamp(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = datetime(2026, 2, 24, 12, 0, tzinfo=UTC)
+    future = now + timedelta(seconds=0.6)
+    logger = logging.getLogger("test")
+
+    with caplog.at_level(logging.WARNING):
+        age = day7_cli._normalized_weather_age_seconds(
+            now=now,
+            retrieval_timestamp=future,
+            logger=logger,
+        )
+
+    assert age == 0.0
+    assert any("clamping age to 0" in record.message.lower() for record in caplog.records)
+
+
+def test_normalized_weather_age_seconds_preserves_positive_value() -> None:
+    now = datetime(2026, 2, 24, 12, 0, tzinfo=UTC)
+    past = now - timedelta(seconds=123)
+    logger = logging.getLogger("test")
+
+    age = day7_cli._normalized_weather_age_seconds(
+        now=now,
+        retrieval_timestamp=past,
+        logger=logger,
+    )
+
+    assert age == 123.0
+
+
+# --- Final reconciliation read after cancel failure ---
+
+
+def test_final_reconciliation_resolves_canceled_after_cancel_error() -> None:
+    """Cancel API call fails, but final get_order shows the order is canceled."""
+    clock = _StepClock(step_seconds=5.0)
+    adapter = _FakeAdapter(
+        submit_seq=[_status(order_id="o-frc", normalized="open")],
+        cancel_seq=[
+            OrderAdapterError(
+                "cancel 404: not found",
+                category="validation",
+                status_code=404,
+            )
+        ],
+        get_seq=[
+            # _final_reconciliation_read returns terminal
+            # (poll loop exits without calling get_order because clock jumps past deadline)
+            _status(
+                order_id="o-frc",
+                normalized="canceled",
+                raw="canceled",
+                filled=0,
+                remaining=1,
+            ),
+        ],
+    )
+    runner = LiveMicroRunner(
+        settings=_settings(micro_require_supervised_mode=False),
+        adapter=adapter,  # type: ignore[arg-type]
+        logger=logging.getLogger("test"),
+        now_provider=clock,
+        sleep_fn=lambda _: None,
+    )
+    result = runner.run_candidates(
+        candidates=[_candidate()],
+        supervised=True,
+        poll_timeout_seconds=2.0,
+        poll_interval_seconds=0.1,
+    )
+    assert result.attempts[0].outcome == "canceled"
+    assert result.attempts[0].unresolved is False
+    assert result.summary.cancels == 1
+    assert result.summary.halted_early is False
+
+
+def test_final_reconciliation_resolves_filled_after_post_cancel_poll_timeout() -> None:
+    """Cancel succeeds but returns non-terminal; post-cancel poll times out.
+    Final reconciliation read discovers the order filled on the exchange."""
+    clock = _StepClock(step_seconds=5.0)
+    adapter = _FakeAdapter(
+        submit_seq=[_status(order_id="o-frp", normalized="open")],
+        cancel_seq=[
+            _status(order_id="o-frp", normalized="open", raw="open")
+        ],
+        get_seq=[
+            # _final_reconciliation_read discovers fill
+            # (both poll loops exit without calling get_order because clock jumps)
+            _status(
+                order_id="o-frp",
+                normalized="filled",
+                raw="filled",
+                filled=1,
+                remaining=0,
+            ),
+        ],
+    )
+    runner = LiveMicroRunner(
+        settings=_settings(micro_require_supervised_mode=False),
+        adapter=adapter,  # type: ignore[arg-type]
+        logger=logging.getLogger("test"),
+        now_provider=clock,
+        sleep_fn=lambda _: None,
+    )
+    result = runner.run_candidates(
+        candidates=[_candidate()],
+        supervised=True,
+        poll_timeout_seconds=2.0,
+        poll_interval_seconds=0.1,
+    )
+    assert result.attempts[0].outcome == "filled"
+    assert result.attempts[0].unresolved is False
+    assert result.summary.fills == 1
+
+
+def test_final_reconciliation_still_unresolved_when_status_non_terminal() -> None:
+    """Final reconciliation read also returns non-terminal → stays unresolved + halt."""
+    clock = _StepClock(step_seconds=5.0)
+    adapter = _FakeAdapter(
+        submit_seq=[_status(order_id="o-fru", normalized="open")],
+        cancel_seq=[
+            OrderAdapterError(
+                "cancel 404: not found",
+                category="validation",
+                status_code=404,
+            )
+        ],
+        get_seq=[
+            # _final_reconciliation_read still non-terminal
+            # (poll loop exits without calling get_order because clock jumps)
+            _status(order_id="o-fru", normalized="open"),
+        ],
+    )
+    runner = LiveMicroRunner(
+        settings=_settings(micro_require_supervised_mode=False),
+        adapter=adapter,  # type: ignore[arg-type]
+        logger=logging.getLogger("test"),
+        now_provider=clock,
+        sleep_fn=lambda _: None,
+    )
+    result = runner.run_candidates(
+        candidates=[_candidate()],
+        supervised=True,
+        poll_timeout_seconds=2.0,
+        poll_interval_seconds=0.1,
+    )
+    assert result.attempts[0].outcome == "unresolved"
+    assert result.attempts[0].unresolved is True
+    assert result.summary.halted_early is True
+    assert "reconciliation_unresolved" in (result.summary.halt_reason or "")
+
+
+def test_final_reconciliation_still_unresolved_when_read_fails() -> None:
+    """Final reconciliation read throws → stays unresolved + halt."""
+    clock = _StepClock(step_seconds=5.0)
+
+    class _FailingGetAdapter(_FakeAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                submit_seq=[_status(order_id="o-frf", normalized="open")],
+                cancel_seq=[
+                    OrderAdapterError(
+                        "cancel 404: not found",
+                        category="validation",
+                        status_code=404,
+                    )
+                ],
+                get_seq=[],
+            )
+
+        def get_order(self, order_id: str, **kwargs: Any) -> KalshiOrderStatus:
+            # Every get_order call fails — poll loop exits via clock,
+            # final reconciliation read also fails
+            raise OrderAdapterError(
+                "get order 500: internal error",
+                category="server",
+                status_code=500,
+            )
+
+    adapter = _FailingGetAdapter()
+    runner = LiveMicroRunner(
+        settings=_settings(micro_require_supervised_mode=False),
+        adapter=adapter,  # type: ignore[arg-type]
+        logger=logging.getLogger("test"),
+        now_provider=clock,
+        sleep_fn=lambda _: None,
+    )
+    result = runner.run_candidates(
+        candidates=[_candidate()],
+        supervised=True,
+        poll_timeout_seconds=2.0,
+        poll_interval_seconds=0.1,
+    )
+    assert result.attempts[0].outcome == "unresolved"
+    assert result.attempts[0].unresolved is True
+    assert result.summary.halted_early is True

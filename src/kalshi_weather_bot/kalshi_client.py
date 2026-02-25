@@ -7,9 +7,10 @@ import logging
 import random
 import re
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlsplit
 
 import httpx
 
@@ -125,7 +126,13 @@ class KalshiClient:
             )
         return {"ok": True, "sample_market_count": len(markets)}
 
-    def fetch_markets_raw(self, limit: int | None = None) -> dict[str, Any] | list[Any]:
+    def fetch_markets_raw(
+        self,
+        limit: int | None = None,
+        *,
+        candidate_predicate: Callable[[dict[str, Any]], bool] | None = None,
+        candidate_target: int | None = None,
+    ) -> dict[str, Any] | list[Any]:
         """Fetch raw markets payload from Kalshi, with optional cursor pagination."""
         effective_limit = limit or self.settings.kalshi_default_limit
         params: dict[str, Any] = {"limit": effective_limit}
@@ -152,15 +159,25 @@ class KalshiClient:
         page_sleep_seconds = (
             self._get_non_negative_int_setting("kalshi_page_sleep_ms", 100) / 1000.0
         )
+        effective_candidate_target = (
+            candidate_target
+            if isinstance(candidate_target, int)
+            and candidate_target > 0
+            and candidate_predicate is not None
+            else None
+        )
 
         deduped_records: list[Any] = []
         seen_keys: set[str] = set()
         seen_cursors: set[str] = set()
         deduped_count = 0
+        candidate_matches_found = 0
 
         def _append_records(page_records: list[Any]) -> None:
-            nonlocal deduped_count
+            nonlocal deduped_count, candidate_matches_found
             for record in page_records:
+                if len(deduped_records) >= max_markets:
+                    break
                 key = self._market_dedupe_key(record)
                 if key is not None:
                     if key in seen_keys:
@@ -168,10 +185,17 @@ class KalshiClient:
                         continue
                     seen_keys.add(key)
                 deduped_records.append(record)
+                if effective_candidate_target is not None and isinstance(record, dict):
+                    try:
+                        if candidate_predicate(record):
+                            candidate_matches_found += 1
+                    except Exception as exc:  # pragma: no cover - defensive
+                        self.logger.debug(
+                            "Market candidate predicate failed for one record: %s",
+                            type(exc).__name__,
+                        )
 
         _append_records(records)
-        if len(deduped_records) > max_markets:
-            deduped_records = deduped_records[:max_markets]
 
         pages_fetched = 1
         next_cursor = self._extract_pagination_cursor(first_payload)
@@ -186,6 +210,10 @@ class KalshiClient:
                 next_cursor
                 and pages_fetched < max_pages
                 and len(deduped_records) < max_markets
+                and (
+                    effective_candidate_target is None
+                    or candidate_matches_found < effective_candidate_target
+                )
             ):
                 if next_cursor in seen_cursors:
                     self.logger.warning(
@@ -222,7 +250,6 @@ class KalshiClient:
                     break
                 _append_records(page_records)
                 if len(deduped_records) >= max_markets:
-                    deduped_records = deduped_records[:max_markets]
                     pages_fetched += 1
                     next_cursor = self._extract_pagination_cursor(page_payload)
                     break
@@ -233,23 +260,46 @@ class KalshiClient:
                     time.sleep(page_sleep_seconds)
 
         had_more_pages = bool(next_cursor)
+        candidate_target_met = bool(
+            effective_candidate_target is not None
+            and candidate_matches_found >= effective_candidate_target
+        )
+        stopped_on_candidate_target = bool(candidate_target_met and had_more_pages)
         summary = {
             "pagination_enabled": pagination_enabled,
             "pages_fetched": pages_fetched,
             "total_markets_fetched": len(deduped_records),
             "had_more_pages": had_more_pages,
             "deduped_count": deduped_count,
+            "candidate_target": effective_candidate_target,
+            "candidate_matches_found": candidate_matches_found,
+            "candidate_target_met": candidate_target_met,
+            "stopped_on_candidate_target": stopped_on_candidate_target,
             "max_pages_per_fetch": max_pages,
             "max_markets_fetch": max_markets,
         }
-        self.logger.info(
-            "Kalshi markets fetch summary: pages_fetched=%d total_markets_fetched=%d "
-            "had_more_pages=%s deduped_count=%d",
-            pages_fetched,
-            len(deduped_records),
-            had_more_pages,
-            deduped_count,
-        )
+        if effective_candidate_target is not None:
+            self.logger.info(
+                "Kalshi markets fetch summary: pages_fetched=%d total_markets_fetched=%d "
+                "had_more_pages=%s deduped_count=%d candidate_matches_found=%d "
+                "candidate_target=%d stopped_on_candidate_target=%s",
+                pages_fetched,
+                len(deduped_records),
+                had_more_pages,
+                deduped_count,
+                candidate_matches_found,
+                effective_candidate_target,
+                stopped_on_candidate_target,
+            )
+        else:
+            self.logger.info(
+                "Kalshi markets fetch summary: pages_fetched=%d total_markets_fetched=%d "
+                "had_more_pages=%s deduped_count=%d",
+                pages_fetched,
+                len(deduped_records),
+                had_more_pages,
+                deduped_count,
+            )
 
         result: dict[str, Any] = dict(first_payload)
         canonical_key = list_key or "markets"
@@ -282,28 +332,67 @@ class KalshiClient:
 
         TODO(KALSHI_API): confirm cancel endpoint semantics and response schema.
         """
-        endpoint = self._render_order_endpoint(
-            template=self.settings.kalshi_order_cancel_endpoint_template,
-            order_id=order_id,
-        )
-        payload = self._request_json(method="DELETE", endpoint=endpoint)
-        if not isinstance(payload, dict):
-            raise KalshiAPIError("Order cancel payload shape invalid: expected object response.")
-        return payload
+        attempts = self._build_cancel_request_attempts(order_id)
+        last_error: KalshiRequestError | None = None
+        for method, endpoint in attempts:
+            try:
+                payload = self._request_json(
+                    method=method,
+                    endpoint=endpoint,
+                    json_body={} if method == "POST" else None,
+                )
+            except KalshiRequestError as exc:
+                last_error = exc
+                # Only continue fallback probing for route/method incompatibility.
+                if exc.status_code in {404, 405}:
+                    continue
+                raise
+            if not isinstance(payload, dict):
+                raise KalshiAPIError(
+                    "Order cancel payload shape invalid: expected object response."
+                )
+            return payload
+
+        if last_error is not None:
+            raise last_error
+        raise KalshiAPIError("Order cancel request failed: no compatible endpoint/method found.")
 
     def get_order_raw(self, order_id: str) -> dict[str, Any]:
         """Fetch one order by id.
 
         TODO(KALSHI_API): confirm order status endpoint response schema.
         """
-        endpoint = self._render_order_endpoint(
-            template=self.settings.kalshi_order_status_endpoint_template,
-            order_id=order_id,
-        )
-        payload = self._request_json(method="GET", endpoint=endpoint)
-        if not isinstance(payload, dict):
-            raise KalshiAPIError("Order status payload shape invalid: expected object response.")
-        return payload
+        endpoints = [
+            self._render_order_endpoint(template=template, order_id=order_id)
+            for template in self._build_status_endpoint_templates()
+        ]
+        seen: set[str] = set()
+        first_payload: dict[str, Any] | None = None
+        last_error: KalshiRequestError | None = None
+        for endpoint in endpoints:
+            if endpoint in seen:
+                continue
+            seen.add(endpoint)
+            try:
+                payload = self._request_json(method="GET", endpoint=endpoint)
+            except KalshiRequestError as exc:
+                last_error = exc
+                if exc.status_code == 404:
+                    continue
+                raise
+            if not isinstance(payload, dict):
+                raise KalshiAPIError(
+                    "Order status payload shape invalid: expected object response."
+                )
+            if first_payload is None:
+                first_payload = payload
+            if self._looks_like_order_status_payload(payload):
+                return payload
+        if first_payload is not None:
+            return first_payload
+        if last_error is not None:
+            raise last_error
+        raise KalshiAPIError("Order status request failed: no compatible endpoint found.")
 
     def list_orders_raw(self, limit: int = 50) -> dict[str, Any] | list[Any]:
         """Fetch recent orders.
@@ -369,6 +458,39 @@ class KalshiClient:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return None
+
+    @staticmethod
+    def _looks_like_order_status_payload(payload: dict[str, Any]) -> bool:
+        sources: list[dict[str, Any]] = [payload]
+        for key in ("order", "data", "result"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                sources.append(nested)
+
+        status_keys = {"status", "order_status", "state"}
+        quantity_keys = {
+            "filled_quantity",
+            "filled_count",
+            "filled_size",
+            "remaining_quantity",
+            "remaining_count",
+            "remaining_size",
+            "count",
+            "quantity",
+            "size",
+            "requested_quantity",
+            "requested_count",
+        }
+        id_keys = {"order_id", "id", "client_order_id"}
+
+        for source in sources:
+            if any(key in source for key in status_keys):
+                return True
+            if any(key in source for key in quantity_keys) and any(
+                key in source for key in id_keys
+            ):
+                return True
+        return False
 
     @staticmethod
     def _market_dedupe_key(record: Any) -> str | None:
@@ -460,6 +582,75 @@ class KalshiClient:
         self.logger.error(error_message)
         raise KalshiAPIError(error_message) from last_error
 
+    def _build_status_endpoint_templates(self) -> list[str]:
+        primary = self.settings.kalshi_order_status_endpoint_template
+        candidates: list[str] = [primary]
+
+        if primary.endswith("/{order_id}"):
+            candidates.append(f"{primary}/status")
+        if primary.endswith("/{order_id}/cancel"):
+            candidates.append(primary[: -len("/cancel")])
+
+        swapped = self._swap_orders_path(primary)
+        if swapped is not None:
+            candidates.append(swapped)
+            if swapped.endswith("/{order_id}"):
+                candidates.append(f"{swapped}/status")
+
+        return self._dedupe_preserve_order(candidates)
+
+    def _build_cancel_request_attempts(self, order_id: str) -> list[tuple[str, str]]:
+        primary_template = self.settings.kalshi_order_cancel_endpoint_template
+        templates: list[str] = [primary_template]
+        if not primary_template.endswith("/{order_id}/cancel"):
+            templates.append(f"{primary_template}/cancel")
+        if primary_template.endswith("/{order_id}/cancel"):
+            templates.append(primary_template[: -len("/cancel")])
+
+        swapped = self._swap_orders_path(primary_template)
+        if swapped is not None:
+            templates.append(swapped)
+            if not swapped.endswith("/{order_id}/cancel"):
+                templates.append(f"{swapped}/cancel")
+
+        methods = ("DELETE", "POST")
+        attempts: list[tuple[str, str]] = []
+        for template in self._dedupe_preserve_order(templates):
+            endpoint = self._render_order_endpoint(template=template, order_id=order_id)
+            for method in methods:
+                attempts.append((method, endpoint))
+        return self._dedupe_attempts(attempts)
+
+    @staticmethod
+    def _swap_orders_path(template: str) -> str | None:
+        if "/portfolio/orders/" in template:
+            return template.replace("/portfolio/orders/", "/orders/")
+        if "/orders/" in template and "/portfolio/orders/" not in template:
+            return template.replace("/orders/", "/portfolio/orders/")
+        return None
+
+    @staticmethod
+    def _dedupe_preserve_order(values: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
+
+    @staticmethod
+    def _dedupe_attempts(attempts: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        result: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for attempt in attempts:
+            if attempt in seen:
+                continue
+            seen.add(attempt)
+            result.append(attempt)
+        return result
+
     def filter_open_weather_markets(self, markets: list[MarketSummary]) -> list[MarketSummary]:
         """Return markets that appear to be both weather-related and currently open."""
         result: list[MarketSummary] = []
@@ -485,16 +676,18 @@ class KalshiClient:
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list[Any]:
         last_error: Exception | None = None
+        request_endpoint, endpoint_query_params = self._split_endpoint_query(endpoint)
+        merged_params = self._merge_request_params(endpoint_query_params, params)
 
         for attempt in range(self.max_retries + 1):
             try:
                 # Build auth headers per-attempt: RSA-PSS signatures include
                 # a fresh timestamp so they must be regenerated on retry.
-                auth_headers = self._build_auth_headers(method=method, path=endpoint)
+                auth_headers = self._build_auth_headers(method=method, path=request_endpoint)
                 response = self._client.request(
                     method=method,
-                    url=endpoint,
-                    params=params,
+                    url=request_endpoint,
+                    params=merged_params,
                     json=json_body,
                     headers=auth_headers,
                 )
@@ -571,6 +764,31 @@ class KalshiClient:
             category="unknown",
             status_code=None,
         )
+
+    @staticmethod
+    def _split_endpoint_query(endpoint: str) -> tuple[str, dict[str, Any]]:
+        """Split endpoint path and query params for robust param merging."""
+        split = urlsplit(endpoint)
+        path = split.path or endpoint
+        query_params: dict[str, Any] = {}
+        if split.query:
+            for key, value in parse_qsl(split.query, keep_blank_values=True):
+                query_params[key] = value
+        return path, query_params
+
+    @staticmethod
+    def _merge_request_params(
+        endpoint_params: dict[str, Any],
+        request_params: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Merge endpoint query params with explicit request params.
+
+        Explicit request params take precedence.
+        """
+        merged: dict[str, Any] = dict(endpoint_params)
+        if request_params:
+            merged.update(request_params)
+        return merged or None
 
     @staticmethod
     def _render_order_endpoint(template: str, order_id: str) -> str:

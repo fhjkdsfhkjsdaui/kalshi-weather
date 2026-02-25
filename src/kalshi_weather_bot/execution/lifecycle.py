@@ -31,6 +31,7 @@ _ALLOWED_TRANSITIONS: dict[LifecycleState, set[LifecycleState]] = {
     "submit_rejected": set(),
     "cancel_requested": {
         "cancel_ack",
+        "canceled",
         "filled",
         "partially_filled",
         "timeout",

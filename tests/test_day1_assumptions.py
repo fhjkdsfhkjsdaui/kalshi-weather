@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa as rsa_module
@@ -199,6 +200,87 @@ class TestExtractMarketRecords:
         client = _make_client()
         payload = {"markets": []}
         assert client.extract_market_records(payload) == []
+
+
+# ===========================================================================
+# 2b. Request param handling — endpoint query + params merge
+# ===========================================================================
+
+class TestRequestParamMerging:
+    """Verify endpoint query params are preserved when request params are provided."""
+
+    def test_request_json_merges_endpoint_query_params(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = _make_client()
+        captured: dict[str, Any] = {}
+
+        def _fake_auth_headers(method: str = "GET", path: str = "/") -> dict[str, str]:
+            captured["signed_path"] = path
+            return {}
+
+        def _fake_request(
+            method: str,
+            url: str,
+            params: dict[str, Any] | None = None,
+            json: dict[str, Any] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> httpx.Response:
+            captured["url"] = url
+            captured["params"] = params
+            request = httpx.Request(method, f"https://api.example.com{url}")
+            return httpx.Response(200, request=request, json={"markets": []})
+
+        monkeypatch.setattr(client, "_build_auth_headers", _fake_auth_headers)
+        monkeypatch.setattr(client._client, "request", _fake_request)
+
+        payload = client._request_json(
+            "GET",
+            "/trade-api/v2/markets?series_ticker=KXHIGHNY&status=open",
+            params={"limit": 1000, "cursor": "abc123"},
+        )
+
+        assert payload == {"markets": []}
+        assert captured["url"] == "/trade-api/v2/markets"
+        assert captured["signed_path"] == "/trade-api/v2/markets"
+        assert captured["params"] == {
+            "series_ticker": "KXHIGHNY",
+            "status": "open",
+            "limit": 1000,
+            "cursor": "abc123",
+        }
+
+    def test_request_params_override_endpoint_query_params(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _make_client()
+        captured: dict[str, Any] = {}
+
+        def _fake_auth_headers(method: str = "GET", path: str = "/") -> dict[str, str]:
+            return {}
+
+        def _fake_request(
+            method: str,
+            url: str,
+            params: dict[str, Any] | None = None,
+            json: dict[str, Any] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> httpx.Response:
+            captured["params"] = params
+            request = httpx.Request(method, f"https://api.example.com{url}")
+            return httpx.Response(200, request=request, json={"markets": []})
+
+        monkeypatch.setattr(client, "_build_auth_headers", _fake_auth_headers)
+        monkeypatch.setattr(client._client, "request", _fake_request)
+
+        client._request_json(
+            "GET",
+            "/trade-api/v2/markets?limit=5&status=closed",
+            params={"limit": 25, "status": "open"},
+        )
+
+        assert captured["params"] == {"limit": 25, "status": "open"}
 
 
 # ===========================================================================
