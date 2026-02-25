@@ -83,6 +83,7 @@ _WEATHER_EVENT_TICKER_PREFIXES = (
     "KXWIND",
     "KXWEATHER",
 )
+_WEATHER_CITY_TEMP_RE = re.compile(r"^KX(?:HIGH|LOW)[A-Z]{2,8}(?:-|$)")
 
 
 @dataclass
@@ -200,10 +201,15 @@ class KalshiWeatherContractParser:
         )
 
     def _is_weather_candidate(self, search_text: str, market: dict[str, Any]) -> bool:
-        event_ticker = self._first_string(market, ("event_ticker", "ticker"))
+        event_ticker = self._first_string(
+            market,
+            ("event_ticker", "series_ticker", "ticker", "event_id"),
+        )
         if event_ticker:
             normalized_event_ticker = event_ticker.strip().upper()
             if normalized_event_ticker.startswith(_WEATHER_EVENT_TICKER_PREFIXES):
+                return True
+            if _WEATHER_CITY_TEMP_RE.match(normalized_event_ticker):
                 return True
 
         tags = market.get("tags")
@@ -214,7 +220,7 @@ class KalshiWeatherContractParser:
 
         category = self._first_string(
             market,
-            ("category", "series", "event_category", "event_ticker"),
+            ("category", "series", "event_category", "event_ticker", "series_ticker"),
         )
         if category and "weather" in category.lower():
             return True
@@ -259,13 +265,18 @@ class KalshiWeatherContractParser:
         # It will still be flagged as weather_candidate but dimension=None
         # forces the contract through the rejection path, preventing
         # overconfident parsing of ambiguous titles.
-        event_ticker = self._first_string(market, ("event_ticker", "ticker"))
+        event_ticker = self._first_string(market, ("event_ticker", "series_ticker", "ticker"))
         if event_ticker:
             normalized_event_ticker = event_ticker.strip().upper()
             if "HIGHTEMP" in normalized_event_ticker:
                 return "temperature", "high_temp"
             if "LOWTEMP" in normalized_event_ticker:
                 return "temperature", "low_temp"
+            if _WEATHER_CITY_TEMP_RE.match(normalized_event_ticker):
+                if normalized_event_ticker.startswith("KXHIGH"):
+                    return "temperature", "high_temp"
+                if normalized_event_ticker.startswith("KXLOW"):
+                    return "temperature", "low_temp"
             if "SNOW" in normalized_event_ticker:
                 return "snowfall", "snowfall_accumulation"
             if "RAIN" in normalized_event_ticker or "PRECIP" in normalized_event_ticker:
@@ -360,7 +371,7 @@ class KalshiWeatherContractParser:
             low = self._to_float(match.group("low"))
             high = self._to_float(match.group("high"))
             unit = self._normalize_unit(match.group("u1") or match.group("u2"))
-            if low is not None and high is not None and unit:
+            if low is not None and high is not None:
                 if high < low:
                     low, high = high, low
                 return _ThresholdExtraction(operator="range", low=low, high=high, unit=unit)

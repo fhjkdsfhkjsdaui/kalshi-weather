@@ -281,7 +281,6 @@ def _evaluate_signal_candidates(
     logger: Any,
     journal: JournalWriter,
 ) -> tuple[list[MicroTradeCandidate], list[SignalRejection], dict[str, int]]:
-    now = datetime.now(UTC)
     scan_limit = args.max_markets_to_scan or settings.signal_max_markets_to_scan
     parser = KalshiWeatherContractParser(logger=logger)
 
@@ -302,6 +301,8 @@ def _evaluate_signal_candidates(
         logger=logger,
         journal=journal,
     )
+    # Compute "now" after weather retrieval to avoid negative age under normal latency.
+    now = datetime.now(UTC)
     weather_ref = weather_snapshot.raw_payload_path or weather_snapshot.source_url
     weather_age_seconds = _normalized_weather_age_seconds(
         now=now,
