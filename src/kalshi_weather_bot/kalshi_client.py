@@ -132,11 +132,17 @@ class KalshiClient:
         *,
         candidate_predicate: Callable[[dict[str, Any]], bool] | None = None,
         candidate_target: int | None = None,
+        extra_params: dict[str, Any] | None = None,
     ) -> dict[str, Any] | list[Any]:
-        """Fetch raw markets payload from Kalshi, with optional cursor pagination."""
+        """Fetch raw markets payload from Kalshi, with optional cursor pagination.
+
+        ``extra_params`` are merged into every page request (e.g.
+        ``{"series_ticker": "KXHIGHNY", "status": "open"}``).
+        """
         effective_limit = limit or self.settings.kalshi_default_limit
         params: dict[str, Any] = {"limit": effective_limit}
-        # TODO(KALSHI_API): confirm if status/open filter query params are supported.
+        if extra_params:
+            params.update(extra_params)
         first_payload = self._request_markets_page_with_retry(
             params=params,
             page_index=1,
@@ -166,17 +172,43 @@ class KalshiClient:
             and candidate_predicate is not None
             else None
         )
+        # When candidate-target pagination is active, continue scanning pages until the
+        # target is met (or page cap hit) rather than stopping early at max_markets.
+        effective_max_markets = max_markets
+        if effective_candidate_target is not None and max_pages > 0 and effective_limit > 0:
+            effective_max_markets = max(max_markets, max_pages * effective_limit)
 
         deduped_records: list[Any] = []
         seen_keys: set[str] = set()
         seen_cursors: set[str] = set()
         deduped_count = 0
         candidate_matches_found = 0
+        page_diagnostics: list[dict[str, Any]] = []
+        stop_reason: str | None = None
 
-        def _append_records(page_records: list[Any]) -> None:
-            nonlocal deduped_count, candidate_matches_found
+        def _sample_tickers(page_records: list[Any], *, max_items: int = 3) -> list[str]:
+            sample: list[str] = []
             for record in page_records:
-                if len(deduped_records) >= max_markets:
+                if not isinstance(record, dict):
+                    continue
+                ticker = (
+                    record.get("ticker")
+                    or record.get("event_ticker")
+                    or record.get("symbol")
+                    or record.get("market_id")
+                    or record.get("id")
+                )
+                if isinstance(ticker, str) and ticker.strip():
+                    sample.append(ticker.strip())
+                if len(sample) >= max_items:
+                    break
+            return sample
+
+        def _append_records(page_records: list[Any]) -> int:
+            nonlocal deduped_count, candidate_matches_found
+            page_candidate_matches = 0
+            for record in page_records:
+                if len(deduped_records) >= effective_max_markets:
                     break
                 key = self._market_dedupe_key(record)
                 if key is not None:
@@ -189,17 +221,38 @@ class KalshiClient:
                     try:
                         if candidate_predicate(record):
                             candidate_matches_found += 1
+                            page_candidate_matches += 1
                     except Exception as exc:  # pragma: no cover - defensive
                         self.logger.debug(
                             "Market candidate predicate failed for one record: %s",
                             type(exc).__name__,
                         )
+            return page_candidate_matches
 
-        _append_records(records)
+        first_page_matches = _append_records(records)
+        page_diagnostics.append(
+            {
+                "page_index": 1,
+                "records_on_page": len(records),
+                "sample_tickers": _sample_tickers(records),
+                "candidate_matches_page": first_page_matches,
+                "candidate_matches_cumulative": candidate_matches_found,
+            }
+        )
+        self.logger.info(
+            "Kalshi markets page diagnostics: page_index=%d records=%d "
+            "sample_tickers=%s candidate_matches_page=%d candidate_matches_cumulative=%d",
+            1,
+            len(records),
+            _sample_tickers(records),
+            first_page_matches,
+            candidate_matches_found,
+        )
 
         pages_fetched = 1
         next_cursor = self._extract_pagination_cursor(first_payload)
         if not pagination_enabled and next_cursor:
+            stop_reason = "pagination_disabled"
             self.logger.warning(
                 "Kalshi pagination disabled for this run; additional market pages "
                 "were not fetched.",
@@ -209,13 +262,14 @@ class KalshiClient:
             while (
                 next_cursor
                 and pages_fetched < max_pages
-                and len(deduped_records) < max_markets
+                and len(deduped_records) < effective_max_markets
                 and (
                     effective_candidate_target is None
                     or candidate_matches_found < effective_candidate_target
                 )
             ):
                 if next_cursor in seen_cursors:
+                    stop_reason = "repeated_cursor"
                     self.logger.warning(
                         "Kalshi pagination: repeated cursor detected, stopping. "
                         "pages_fetched=%d",
@@ -223,8 +277,11 @@ class KalshiClient:
                     )
                     break
                 seen_cursors.add(next_cursor)
+                page_params: dict[str, Any] = {"limit": effective_limit, "cursor": next_cursor}
+                if extra_params:
+                    page_params.update(extra_params)
                 page_payload = self._request_markets_page_with_retry(
-                    params={"limit": effective_limit, "cursor": next_cursor},
+                    params=page_params,
                     page_index=pages_fetched + 1,
                     cursor_present=True,
                     pages_fetched_so_far=pages_fetched,
@@ -240,6 +297,7 @@ class KalshiClient:
                         "Kalshi paginated markets payload missing records list."
                     )
                 if not page_records:
+                    stop_reason = "empty_page"
                     self.logger.warning(
                         "Kalshi pagination: empty page received, stopping. "
                         "pages_fetched=%d",
@@ -248,14 +306,31 @@ class KalshiClient:
                     pages_fetched += 1
                     next_cursor = self._extract_pagination_cursor(page_payload)
                     break
-                _append_records(page_records)
-                if len(deduped_records) >= max_markets:
-                    pages_fetched += 1
-                    next_cursor = self._extract_pagination_cursor(page_payload)
-                    break
-
+                page_candidate_matches = _append_records(page_records)
                 pages_fetched += 1
                 next_cursor = self._extract_pagination_cursor(page_payload)
+                page_diagnostics.append(
+                    {
+                        "page_index": pages_fetched,
+                        "records_on_page": len(page_records),
+                        "sample_tickers": _sample_tickers(page_records),
+                        "candidate_matches_page": page_candidate_matches,
+                        "candidate_matches_cumulative": candidate_matches_found,
+                    }
+                )
+                self.logger.info(
+                    "Kalshi markets page diagnostics: page_index=%d records=%d "
+                    "sample_tickers=%s candidate_matches_page=%d candidate_matches_cumulative=%d",
+                    pages_fetched,
+                    len(page_records),
+                    _sample_tickers(page_records),
+                    page_candidate_matches,
+                    candidate_matches_found,
+                )
+                if len(deduped_records) >= effective_max_markets:
+                    stop_reason = "market_cap_reached"
+                    break
+
                 if next_cursor and page_sleep_seconds > 0:
                     time.sleep(page_sleep_seconds)
 
@@ -265,6 +340,15 @@ class KalshiClient:
             and candidate_matches_found >= effective_candidate_target
         )
         stopped_on_candidate_target = bool(candidate_target_met and had_more_pages)
+        if stop_reason is None:
+            if candidate_target_met:
+                stop_reason = "target_reached"
+            elif had_more_pages and pages_fetched >= max_pages:
+                stop_reason = "page_cap_reached"
+            elif had_more_pages and len(deduped_records) >= effective_max_markets:
+                stop_reason = "market_cap_reached"
+            else:
+                stop_reason = "no_more_pages"
         summary = {
             "pagination_enabled": pagination_enabled,
             "pages_fetched": pages_fetched,
@@ -275,14 +359,17 @@ class KalshiClient:
             "candidate_matches_found": candidate_matches_found,
             "candidate_target_met": candidate_target_met,
             "stopped_on_candidate_target": stopped_on_candidate_target,
+            "stop_reason": stop_reason,
             "max_pages_per_fetch": max_pages,
             "max_markets_fetch": max_markets,
+            "effective_max_markets": effective_max_markets,
+            "page_diagnostics": page_diagnostics,
         }
         if effective_candidate_target is not None:
             self.logger.info(
                 "Kalshi markets fetch summary: pages_fetched=%d total_markets_fetched=%d "
                 "had_more_pages=%s deduped_count=%d candidate_matches_found=%d "
-                "candidate_target=%d stopped_on_candidate_target=%s",
+                "candidate_target=%d stopped_on_candidate_target=%s stop_reason=%s",
                 pages_fetched,
                 len(deduped_records),
                 had_more_pages,
@@ -290,15 +377,17 @@ class KalshiClient:
                 candidate_matches_found,
                 effective_candidate_target,
                 stopped_on_candidate_target,
+                stop_reason,
             )
         else:
             self.logger.info(
                 "Kalshi markets fetch summary: pages_fetched=%d total_markets_fetched=%d "
-                "had_more_pages=%s deduped_count=%d",
+                "had_more_pages=%s deduped_count=%d stop_reason=%s",
                 pages_fetched,
                 len(deduped_records),
                 had_more_pages,
                 deduped_count,
+                stop_reason,
             )
 
         result: dict[str, Any] = dict(first_payload)

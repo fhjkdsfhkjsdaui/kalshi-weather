@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     )
     kalshi_page_retry_base_ms: int = Field(default=250, alias="KALSHI_PAGE_RETRY_BASE_MS")
     kalshi_page_retry_jitter_ms: int = Field(default=100, alias="KALSHI_PAGE_RETRY_JITTER_MS")
+    kalshi_weather_series_tickers: str = Field(
+        default="KXHIGHNY,KXLOWNY,KXHIGHCHI,KXLOWCHI",
+        alias="KALSHI_WEATHER_SERIES_TICKERS",
+    )
 
     journal_dir: Path = Field(default=Path("./data/journal"), alias="JOURNAL_DIR")
     raw_payload_dir: Path = Field(default=Path("./data/raw"), alias="RAW_PAYLOAD_DIR")
@@ -464,6 +468,7 @@ class Settings(BaseSettings):
             "kalshi_page_fetch_max_retries": self.kalshi_page_fetch_max_retries,
             "kalshi_page_retry_base_ms": self.kalshi_page_retry_base_ms,
             "kalshi_page_retry_jitter_ms": self.kalshi_page_retry_jitter_ms,
+            "kalshi_weather_series_tickers": self.kalshi_weather_series_tickers,
             "orders_endpoint": self.kalshi_orders_endpoint,
             "weather_timeout_seconds": self.weather_timeout_seconds,
             "weather_raw_journaling": self.weather_journal_raw_payloads,

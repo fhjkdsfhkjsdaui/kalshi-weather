@@ -186,6 +186,102 @@ def _resolve_market_records(
     return records
 
 
+def _parse_weather_series_tickers(settings: Settings) -> list[str]:
+    """Parse comma-separated weather series tickers from config, returning deduped list."""
+    raw = settings.kalshi_weather_series_tickers
+    if not raw or not raw.strip():
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if token and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
+
+
+def _fetch_weather_series_fanout(
+    *,
+    client: KalshiClient,
+    series_tickers: list[str],
+    limit: int,
+    candidate_predicate: Callable[[dict[str, Any]], bool] | None,
+    candidate_target: int | None,
+    logger: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fan out one fetch per weather series_ticker, merge and dedupe records.
+
+    Returns ``(merged_records, aggregated_diagnostics)``.
+    """
+    all_records: list[dict[str, Any]] = []
+    seen_tickers: set[str] = set()
+    total_candidate_matches = 0
+    series_results: list[dict[str, Any]] = []
+
+    for series_ticker in series_tickers:
+        logger.info(
+            "Weather series fan-out: fetching series_ticker=%s",
+            series_ticker,
+        )
+        payload = client.fetch_markets_raw(
+            limit=limit,
+            candidate_target=candidate_target,
+            candidate_predicate=candidate_predicate,
+            extra_params={"series_ticker": series_ticker, "status": "open"},
+        )
+        page_records = _extract_market_records(payload)
+        page_diag = _extract_market_fetch_diagnostics(payload, record_count=len(page_records))
+
+        # Dedupe across series calls by market ticker.
+        new_count = 0
+        for record in page_records:
+            if not isinstance(record, dict):
+                continue
+            ticker = record.get("ticker")
+            ticker_key = ticker.strip() if isinstance(ticker, str) else ""
+            if ticker_key and ticker_key in seen_tickers:
+                continue
+            if ticker_key:
+                seen_tickers.add(ticker_key)
+            all_records.append(record)
+            new_count += 1
+
+        series_candidate_matches = page_diag.get("candidate_matches_found", 0)
+        total_candidate_matches += series_candidate_matches
+        series_results.append({
+            "series_ticker": series_ticker,
+            "records_fetched": len(page_records),
+            "records_new": new_count,
+            "candidate_matches_found": series_candidate_matches,
+            "pages_fetched": page_diag.get("pages_fetched", 1),
+            "stop_reason": page_diag.get("stop_reason"),
+        })
+        logger.info(
+            "Weather series fan-out: series_ticker=%s records=%d new=%d candidates=%d",
+            series_ticker,
+            len(page_records),
+            new_count,
+            series_candidate_matches,
+        )
+
+    diagnostics: dict[str, Any] = {
+        "fetch_strategy": "weather_series_fanout",
+        "series_tickers_queried": series_tickers,
+        "series_count": len(series_tickers),
+        "total_markets_fetched": len(all_records),
+        "total_candidate_matches_found": total_candidate_matches,
+        "candidate_matches_found": total_candidate_matches,
+        "series_results": series_results,
+        "pages_fetched": sum(sr["pages_fetched"] for sr in series_results),
+        "had_more_pages": False,
+        "deduped_count": sum(
+            sr["records_fetched"] - sr["records_new"] for sr in series_results
+        ),
+    }
+    return all_records, diagnostics
+
+
 def _resolve_market_records_with_diagnostics(
     *,
     args: argparse.Namespace,
@@ -211,8 +307,40 @@ def _resolve_market_records_with_diagnostics(
         return records, diagnostics
 
     limit = args.max_markets_to_scan or settings.signal_max_markets_to_scan
+    weather_series = _parse_weather_series_tickers(settings)
+
     with KalshiClient(settings=settings, logger=logger) as client:
         client.validate_connection()
+
+        if weather_series and weather_candidate_predicate is not None:
+            logger.info(
+                "Using weather series fan-out fetch strategy with %d series: %s",
+                len(weather_series),
+                weather_series,
+            )
+            records, diagnostics = _fetch_weather_series_fanout(
+                client=client,
+                series_tickers=weather_series,
+                limit=limit,
+                candidate_predicate=weather_candidate_predicate,
+                candidate_target=weather_candidate_target,
+                logger=logger,
+            )
+            raw_path = journal.write_raw_snapshot(
+                "day5_markets_fanout",
+                {"records": records, "diagnostics": diagnostics},
+            )
+            journal.write_event(
+                "signal_markets_input_loaded",
+                payload={
+                    "source": "api_fanout",
+                    "limit": limit,
+                    "raw_snapshot_path": str(raw_path),
+                    **diagnostics,
+                },
+            )
+            return records, diagnostics
+
         payload = client.fetch_markets_raw(
             limit=limit,
             candidate_target=weather_candidate_target,
@@ -220,6 +348,7 @@ def _resolve_market_records_with_diagnostics(
         )
     records = _extract_market_records(payload)
     diagnostics = _extract_market_fetch_diagnostics(payload, record_count=len(records))
+    diagnostics.setdefault("fetch_strategy", "broad_scan")
     raw_path = journal.write_raw_snapshot("day5_markets", payload)
     journal.write_event(
         "signal_markets_input_loaded",
@@ -264,6 +393,18 @@ def _extract_market_fetch_diagnostics(
         deduped_count = pagination.get("deduped_count")
         if isinstance(deduped_count, int) and deduped_count >= 0:
             diagnostics["deduped_count"] = deduped_count
+        candidate_matches_found = pagination.get("candidate_matches_found")
+        if isinstance(candidate_matches_found, int) and candidate_matches_found >= 0:
+            diagnostics["candidate_matches_found"] = candidate_matches_found
+        candidate_target = pagination.get("candidate_target")
+        if isinstance(candidate_target, int) and candidate_target > 0:
+            diagnostics["candidate_target"] = candidate_target
+        stopped_on_candidate_target = pagination.get("stopped_on_candidate_target")
+        if isinstance(stopped_on_candidate_target, bool):
+            diagnostics["stopped_on_candidate_target"] = stopped_on_candidate_target
+        stop_reason = pagination.get("stop_reason")
+        if isinstance(stop_reason, str) and stop_reason:
+            diagnostics["stop_reason"] = stop_reason
         return diagnostics
 
     diagnostics["had_more_pages"] = cursor_present

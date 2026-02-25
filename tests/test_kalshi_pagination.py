@@ -107,6 +107,7 @@ def test_fetch_markets_stops_at_max_pages(monkeypatch: Any) -> None:
     assert [item["ticker"] for item in payload["markets"]] == ["A", "B"]
     assert payload["pagination"]["pages_fetched"] == 2
     assert payload["pagination"]["had_more_pages"] is True
+    assert payload["pagination"]["stop_reason"] == "page_cap_reached"
     assert calls == 2
 
 
@@ -526,6 +527,10 @@ def test_day5_diagnostics_extraction_from_pagination_payload() -> None:
             "total_markets_fetched": 200,
             "had_more_pages": True,
             "deduped_count": 5,
+            "candidate_matches_found": 7,
+            "candidate_target": 100,
+            "stopped_on_candidate_target": False,
+            "stop_reason": "page_cap_reached",
         },
     }
     diag = _extract_market_fetch_diagnostics(payload, record_count=2)
@@ -533,6 +538,10 @@ def test_day5_diagnostics_extraction_from_pagination_payload() -> None:
     assert diag["total_markets_fetched"] == 200
     assert diag["had_more_pages"] is True
     assert diag["deduped_count"] == 5
+    assert diag["candidate_matches_found"] == 7
+    assert diag["candidate_target"] == 100
+    assert diag["stopped_on_candidate_target"] is False
+    assert diag["stop_reason"] == "page_cap_reached"
 
 
 def test_day5_diagnostics_fallback_without_pagination() -> None:
@@ -674,6 +683,67 @@ def test_fetch_markets_stops_when_weather_candidate_target_met(monkeypatch: Any)
     assert payload["pagination"]["candidate_target"] == 1
     assert payload["pagination"]["candidate_target_met"] is True
     assert payload["pagination"]["stopped_on_candidate_target"] is True
+    assert payload["pagination"]["stop_reason"] == "target_reached"
+
+
+def test_fetch_markets_candidate_target_pagination_ignores_market_cap(monkeypatch: Any) -> None:
+    """Candidate-target scans should keep paging (up to page cap) beyond max_markets."""
+    client = _client(
+        kalshi_max_pages_per_fetch=5,
+        kalshi_max_markets_fetch=2,
+    )
+    responses: list[dict[str, Any]] = [
+        {
+            "markets": [
+                {"event_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-1", "ticker": "SPORT-1"},
+            ],
+            "cursor": "c2",
+        },
+        {
+            "markets": [
+                {"event_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-2", "ticker": "SPORT-2"},
+            ],
+            "cursor": "c3",
+        },
+        {
+            "markets": [
+                {"event_ticker": "KXHIGHTEMP-NYC", "ticker": "KXHIGHTEMP-NYC-90"},
+            ],
+        },
+    ]
+    calls = 0
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        del method, endpoint, params, json_body
+        response = responses[calls]
+        calls += 1
+        return response
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        payload = client.fetch_markets_raw(
+            limit=100,
+            candidate_target=1,
+            candidate_predicate=lambda record: str(record.get("event_ticker", "")).startswith(
+                "KXHIGHTEMP"
+            ),
+        )
+    finally:
+        client.close()
+
+    assert isinstance(payload, dict)
+    assert calls == 3
+    assert payload["pagination"]["pages_fetched"] == 3
+    assert payload["pagination"]["candidate_matches_found"] == 1
+    assert payload["pagination"]["candidate_target_met"] is True
+    assert payload["pagination"]["stop_reason"] == "target_reached"
+    assert payload["pagination"]["effective_max_markets"] == 500
 
 
 def test_fetch_markets_candidate_target_ignored_without_predicate(monkeypatch: Any) -> None:
@@ -705,3 +775,236 @@ def test_fetch_markets_candidate_target_ignored_without_predicate(monkeypatch: A
     assert payload["pagination"]["candidate_matches_found"] == 0
     assert payload["pagination"]["candidate_target_met"] is False
     assert payload["pagination"]["stopped_on_candidate_target"] is False
+
+
+# ---------------------------------------------------------------------------
+# extra_params passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_markets_extra_params_passed_to_all_pages(monkeypatch: Any) -> None:
+    """extra_params should appear in both first and paginated page requests."""
+    client = _client()
+    call_params: list[dict[str, Any] | None] = []
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del method, endpoint, json_body
+        call_params.append(params)
+        if len(call_params) == 1:
+            return {"markets": [{"ticker": "W1"}], "cursor": "c2"}
+        return {"markets": [{"ticker": "W2"}]}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+    try:
+        payload = client.fetch_markets_raw(
+            limit=50,
+            extra_params={"series_ticker": "KXHIGHNY", "status": "open"},
+        )
+    finally:
+        client.close()
+
+    assert isinstance(payload, dict)
+    assert len(call_params) == 2
+    # First page
+    assert call_params[0]["series_ticker"] == "KXHIGHNY"
+    assert call_params[0]["status"] == "open"
+    assert call_params[0]["limit"] == 50
+    # Second page
+    assert call_params[1]["series_ticker"] == "KXHIGHNY"
+    assert call_params[1]["status"] == "open"
+    assert call_params[1]["cursor"] == "c2"
+
+
+# ---------------------------------------------------------------------------
+# Weather series fan-out
+# ---------------------------------------------------------------------------
+
+
+def test_parse_weather_series_tickers_splits_and_dedupes() -> None:
+    """Comma-separated series tickers are parsed and deduped."""
+    from kalshi_weather_bot.day5_cli import _parse_weather_series_tickers
+
+    settings = _settings(kalshi_weather_series_tickers="KXHIGHNY, KXLOWNY,KXHIGHNY ,KXHIGHCHI")
+    result = _parse_weather_series_tickers(settings)
+    assert result == ["KXHIGHNY", "KXLOWNY", "KXHIGHCHI"]
+
+
+def test_parse_weather_series_tickers_empty_string_returns_empty() -> None:
+    """Empty config value disables fan-out."""
+    from kalshi_weather_bot.day5_cli import _parse_weather_series_tickers
+
+    settings = _settings(kalshi_weather_series_tickers="")
+    assert _parse_weather_series_tickers(settings) == []
+
+
+def test_fetch_weather_series_fanout_merges_and_dedupes(monkeypatch: Any) -> None:
+    """Fan-out across two series tickers should merge records and dedupe by ticker."""
+    from kalshi_weather_bot.day5_cli import _fetch_weather_series_fanout
+
+    client = _client()
+    calls: list[dict[str, Any]] = []
+
+    def _fake_request(
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del method, endpoint, json_body
+        calls.append(dict(params or {}))
+        series = (params or {}).get("series_ticker", "")
+        if series == "KXHIGHNY":
+            return {
+                "markets": [
+                    {"ticker": "KXHIGHNY-T39", "event_ticker": "KXHIGHNY-26FEB25"},
+                    {"ticker": "KXHIGHNY-T40", "event_ticker": "KXHIGHNY-26FEB25"},
+                ],
+            }
+        if series == "KXLOWNY":
+            return {
+                "markets": [
+                    {"ticker": "KXLOWNY-T10", "event_ticker": "KXLOWNY-26FEB25"},
+                    # Duplicate from first series — should be deduped
+                    {"ticker": "KXHIGHNY-T39", "event_ticker": "KXHIGHNY-26FEB25"},
+                ],
+            }
+        return {"markets": []}
+
+    monkeypatch.setattr(client, "_request_json", _fake_request)
+
+    def _always_true(record: dict[str, Any]) -> bool:
+        return True
+
+    try:
+        records, diagnostics = _fetch_weather_series_fanout(
+            client=client,
+            series_tickers=["KXHIGHNY", "KXLOWNY"],
+            limit=200,
+            candidate_predicate=_always_true,
+            candidate_target=10,
+            logger=logging.getLogger("test"),
+        )
+    finally:
+        client.close()
+
+    # 2 from KXHIGHNY + 1 new from KXLOWNY (1 was a dupe)
+    assert len(records) == 3
+    tickers = [r["ticker"] for r in records]
+    assert tickers == ["KXHIGHNY-T39", "KXHIGHNY-T40", "KXLOWNY-T10"]
+
+    assert diagnostics["fetch_strategy"] == "weather_series_fanout"
+    assert diagnostics["series_count"] == 2
+    assert diagnostics["total_markets_fetched"] == 3
+    assert diagnostics["deduped_count"] == 1
+    # candidate_matches_found is the sum of per-series counts (pre-dedup)
+    assert diagnostics["candidate_matches_found"] == 4
+
+    # Verify series_ticker was passed as query param
+    assert calls[0]["series_ticker"] == "KXHIGHNY"
+    assert calls[0]["status"] == "open"
+    assert calls[1]["series_ticker"] == "KXLOWNY"
+    assert calls[1]["status"] == "open"
+
+
+def test_fanout_disabled_when_series_tickers_empty(monkeypatch: Any) -> None:
+    """When KALSHI_WEATHER_SERIES_TICKERS is empty, broad scan is used instead."""
+    from kalshi_weather_bot.day5_cli import _parse_weather_series_tickers
+
+    settings = _settings(kalshi_weather_series_tickers="  ")
+    assert _parse_weather_series_tickers(settings) == []
+
+
+def test_resolve_market_records_with_diagnostics_falls_back_when_fanout_disabled(
+    monkeypatch: Any,
+) -> None:
+    """Empty weather series config should keep the existing broad scan path."""
+    from kalshi_weather_bot import day5_cli
+
+    settings = _settings(
+        kalshi_weather_series_tickers="",
+        signal_max_markets_to_scan=200,
+    )
+    args = SimpleNamespace(
+        input_markets_file=None,
+        max_markets_to_scan=200,
+    )
+
+    class _FakeJournal:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        def write_raw_snapshot(self, tag: str, payload: Any) -> str:
+            del payload
+            return f"/tmp/{tag}.json"
+
+        def write_event(
+            self,
+            event_type: str,
+            payload: dict[str, Any],
+            metadata: dict[str, Any] | None = None,
+        ) -> None:
+            del metadata
+            self.events.append({"event_type": event_type, "payload": payload})
+
+    class _FakeClient:
+        def __init__(self, *, settings: Any, logger: Any) -> None:
+            del logger
+            self.settings = settings
+
+        def __enter__(self) -> _FakeClient:
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, exc_tb: Any) -> None:
+            del exc_type, exc, exc_tb
+
+        def validate_connection(self) -> dict[str, Any]:
+            return {"ok": True}
+
+        def fetch_markets_raw(
+            self,
+            limit: int | None = None,
+            *,
+            candidate_predicate: Any = None,
+            candidate_target: int | None = None,
+            extra_params: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            del candidate_predicate, candidate_target
+            calls.append({"limit": limit, "extra_params": extra_params})
+            return {
+                "markets": [{"ticker": "KXHIGHNY-26FEB25-T39"}],
+                "pagination": {
+                    "pages_fetched": 1,
+                    "total_markets_fetched": 1,
+                    "had_more_pages": False,
+                    "deduped_count": 0,
+                    "candidate_matches_found": 1,
+                },
+            }
+
+    calls: list[dict[str, Any]] = []
+    journal = _FakeJournal()
+    monkeypatch.setattr(day5_cli, "KalshiClient", _FakeClient)
+
+    records, diagnostics = day5_cli._resolve_market_records_with_diagnostics(
+        args=args,
+        settings=settings,
+        logger=logging.getLogger("test"),
+        journal=journal,  # type: ignore[arg-type]
+        weather_candidate_target=50,
+        weather_candidate_predicate=lambda _: True,
+    )
+
+    assert len(records) == 1
+    assert calls == [{"limit": 200, "extra_params": None}]
+    assert diagnostics["fetch_strategy"] == "broad_scan"
+    signal_loaded = next(
+        event
+        for event in journal.events
+        if event["event_type"] == "signal_markets_input_loaded"
+    )
+    assert signal_loaded["payload"]["source"] == "api"
